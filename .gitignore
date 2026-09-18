@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+
+# Generados en runtime por app/services/snapshots.py (bind mount de
+# routerkit-api, ver docker-compose.yml). data/examples/ y data/seed/ sí
+# se versionan (este último trae el dataset de BigCodeBench, ver
+# app/services/seed.py).
+/data/current/
+/data/previous/

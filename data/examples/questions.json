@@ -1,0 +1,29 @@
+{
+  "questions": [
+    {
+      "text": "¿La solución esperada probablemente use recursión?",
+      "kind": "binary",
+      "lo": 0,
+      "hi": 1,
+      "author": "example",
+      "version": "v1"
+    },
+    {
+      "text": "¿Qué tan difícil es la tarea, del 1 (trivial) al 10 (muy difícil)?",
+      "kind": "numeric",
+      "lo": 1,
+      "hi": 10,
+      "author": "example",
+      "version": "v1"
+    },
+    {
+      "text": "¿Cuántas líneas tiene el prompt de la tarea?",
+      "kind": "numeric",
+      "lo": 1,
+      "hi": 200,
+      "author": "example",
+      "version": "v1",
+      "script": "def task_func(task_prompt: str) -> float:\n    return float(len(task_prompt.splitlines()))"
+    }
+  ]
+}

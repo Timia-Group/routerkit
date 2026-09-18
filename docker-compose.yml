@@ -1,0 +1,58 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-routerkit}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-routerkit}
+      POSTGRES_DB: ${POSTGRES_DB:-routerkit}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-routerkit} -d ${POSTGRES_DB:-routerkit}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - routerkit-net
+
+  bigcodebench-api:
+    build: ./bigcodebench-api
+    # Sin puertos publicados al host: solo accesible desde routerkit-api,
+    # vía la red interna, por diseño.
+    networks:
+      - routerkit-net
+    restart: unless-stopped
+
+  routerkit-api:
+    build: ./routerkit-api
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-routerkit}:${POSTGRES_PASSWORD:-routerkit}@postgres:5432/${POSTGRES_DB:-routerkit}
+      BIGCODEBENCH_API_URL: http://bigcodebench-api:8000
+      ARTIFACTS_DIR: /data/artifacts
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      bigcodebench-api:
+        condition: service_started
+    ports:
+      - "8000:8000"
+    volumes:
+      # Bind mount (no named volume): así el usuario ve/edita los archivos
+      # directo en ./data desde su computadora, sin entrar al container.
+      # ./data/examples ya trae ejemplos; el container escribe
+      # data/current y data/previous ahí mismo (ver app/services/snapshots.py).
+      - ./data:/data/artifacts
+    networks:
+      - routerkit-net
+    restart: unless-stopped
+
+networks:
+  routerkit-net:
+
+volumes:
+  pgdata:
