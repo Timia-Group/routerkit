@@ -28,11 +28,6 @@ __pycache__/
 # — never committed, deleted once testing is done.
 /data/examples/models_exp2.json
 
-# Same reason: has a real internal Azure hostname for gpt-5.4 (not a
-# secret, but still an internal resource — no reason to leave it in git
-# history).
-/data/examples/models_exp.json
-
 # Trained predictor artifacts (.joblib) — regenerable via POST /train,
 # same reasoning as solutions_exp/validations_exp above.
 /data/predictors/
