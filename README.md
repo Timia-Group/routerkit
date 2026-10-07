@@ -84,6 +84,8 @@ Full field-by-field guide for each file (allowed values, which ones are required
 
 The `*_exp.json`/`*_exp.jsonl` files (e.g. `tasks_exp.jsonl`, `questions_exp.json`) are, instead, the actual data used in the experiment (not a minimal example) — `tasks_exp.jsonl` is the complete BigCodeBench dataset (the same one that's preloaded at startup); the others get added by the team as the experiment runs.
 
+Two of those (`solutions_exp.jsonl`, `validations_exp.jsonl`) are hundreds of MB and aren't part of `git clone` — download them from the repo's [GitHub Releases](https://github.com/Timia-Group/routerkit/releases) page instead (see [`data/examples/README.md`](data/examples/README.md#downloading-solutions_expjsonl--validations_expjsonl) for the exact commands).
+
 ## Key concepts
 
 - **No "experiments" table**: there are no parallel runs or experiment-based scoping. Every catalog reload (tasks/questions/models) or recomputation (features/solutions/grades/targets/model_metrics) always follows the same pattern: **deactivate the old, activate the new** (`active BOOLEAN`, logical deletion). When a "source" row is deactivated (a task, a model), the deactivation cascades to everything computed from it (see [`app/services/cascade.py`](routerkit-api/app/services/cascade.py)). No historical-read endpoint exists on purpose — to see deactivated data, you query Postgres directly.

@@ -11,13 +11,14 @@ __pycache__/
 /data/previous/
 
 # solutions_exp / validations_exp: actual experiment results, very heavy
-# (hundreds of MB) — the raw .jsonl is never committed (it's regenerable),
-# and the .jsonl.gz is ignored ON PURPOSE until it's the FINAL published
-# version (not edited again afterward). For that one-time commit:
-# `git add -f data/examples/solutions_exp.jsonl.gz
-#  data/examples/validations_exp.jsonl.gz`
-# — never via `git add -A`/`git add .`, precisely to avoid accidentally
-# committing an intermediate version.
+# (hundreds of MB). Neither the raw .jsonl nor the .jsonl.gz is ever
+# committed — git history isn't the right place for this (every commit's
+# blob stays forever; purging it later means rewriting history, which
+# breaks anyone who already cloned/forked a public repo). Published
+# instead as compressed assets on the repo's GitHub Releases page — see
+# "Downloading solutions_exp.jsonl / validations_exp.jsonl" in
+# data/examples/README.md for the exact download+gunzip commands, and
+# re-upload the regenerated .gz there (not here) whenever this data changes.
 /data/examples/solutions_exp.jsonl
 /data/examples/validations_exp.jsonl
 /data/examples/solutions_exp.jsonl.gz

@@ -7,6 +7,28 @@ This folder has two kinds of files:
 
 This guide explains, field by field, what can go in each file — so you can build your own `<name>_exp.json`/`.jsonl` (the way `models_exp.json` was built) starting from the matching small example, without having to guess what values each field accepts.
 
+## Downloading `solutions_exp.jsonl` / `validations_exp.jsonl`
+
+These two are real experiment results, several hundred MB uncompressed — too heavy to live in git history, so they're **not** part of `git clone` (see [`.gitignore`](../../.gitignore)). They're published instead as compressed assets on the repo's [GitHub Releases](https://github.com/Timia-Group/routerkit/releases) page. Download and decompress them into this same folder before using them with `type=load`:
+
+```bash
+curl -L -o data/examples/solutions_exp.jsonl.gz \
+  https://github.com/Timia-Group/routerkit/releases/latest/download/solutions_exp.jsonl.gz
+curl -L -o data/examples/validations_exp.jsonl.gz \
+  https://github.com/Timia-Group/routerkit/releases/latest/download/validations_exp.jsonl.gz
+
+gunzip data/examples/solutions_exp.jsonl.gz data/examples/validations_exp.jsonl.gz
+```
+
+(`releases/latest/download/<file>` always resolves to that asset on the most recent release — no version tag to keep up to date here. If you specifically need an older release's version, replace `latest` with its tag, e.g. `releases/download/v1.0.0/solutions_exp.jsonl.gz`.)
+
+Once decompressed, use them exactly like any other `type=load` file (see the `solutions.jsonl`/`validations.jsonl` sections below) — `type=load` expects plain `.jsonl`, not the `.gz`:
+
+```bash
+curl -X POST "localhost:8000/solutions/generate?type=load" -F file=@data/examples/solutions_exp.jsonl
+curl -X POST "localhost:8000/solutions/validate?type=load" -F file=@data/examples/validations_exp.jsonl
+```
+
 ## General rules
 
 - **Full replace vs. targeted replace.** `tasks.jsonl`, `questions.json`, and `models.json` replace **the entire** active catalog of that table when uploaded (`POST /tasks/import`, `/questions/import`, `/models/import`) — anything not in the file stops being active. `features.jsonl`, `solutions.jsonl`, and `validations.jsonl` (the `type=load` of `/features/compute`, `/solutions/generate`, and `/solutions/validate`) replace **only the rows they bring** (identified by their natural key — see each section), the rest of the active catalog is left untouched.
