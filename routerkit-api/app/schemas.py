@@ -1,11 +1,11 @@
-"""Modelos Pydantic usados para documentar (Swagger) y validar el contenido
-de los archivos de import (tasks.jsonl, questions.json, models.json). Todo
-input a routerkit-api es JSON (estandarizado).
+"""Pydantic models used to document (Swagger) and validate the content of
+the import files (tasks.jsonl, questions.json, models.json). All input to
+routerkit-api is JSON (standardized).
 
-Los endpoints de import reciben un archivo (multipart), así que FastAPI no
-puede mostrar el shape de cada fila en el body del request automáticamente;
-estos modelos se usan para validar cada fila ya parseada y quedan
-documentados en el docstring de cada endpoint con un ejemplo.
+The import endpoints receive a file (multipart), so FastAPI can't show the
+shape of each row in the request body automatically; these models are used
+to validate each already-parsed row and are documented in each endpoint's
+docstring with an example.
 """
 
 from typing import Literal
@@ -14,20 +14,28 @@ from pydantic import BaseModel, ConfigDict
 
 
 class TaskImportRow(BaseModel):
-    """Una fila de tasks.jsonl. `bcb_task_id` decide el tipo por fila (no por
-    archivo): si viene con valor (ej. "BigCodeBench/12") es una tarea del
-    benchmark oficial, si se omite es una tarea custom — un mismo archivo
-    puede traer ambas mezcladas."""
+    """A row from tasks.jsonl. `bcb_task_id` decides the type per row (not
+    per file): if it comes with a value (e.g. "BigCodeBench/12") it's an
+    official benchmark task, if omitted it's a custom task — a single file
+    can bring both mixed together.
+
+    `custom_task_id` is the stable key for custom tasks (analogous to
+    `bcb_task_id`, but assigned by the user): if you're later going to
+    reference this task from `features`/`solutions`/`validations`
+    (`type=load`), assign it a `custom_task_id` here — never use the
+    internal Postgres `task_id` for that, it changes depending on insertion
+    order."""
 
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "prompt": "Escribe una función que sume dos enteros.",
-                "tests": "assert suma(2, 3) == 5",
-                "entry_point": "suma",
+                "prompt": "Write a function that adds two integers.",
+                "tests": "assert add(2, 3) == 5",
+                "entry_point": "add",
                 "source": "custom",
                 "tags": ["math", "easy"],
                 "bcb_task_id": None,
+                "custom_task_id": "add-two-integers",
             }
         }
     )
@@ -38,41 +46,53 @@ class TaskImportRow(BaseModel):
     source: str | None = None
     tags: list[str] | None = None
     bcb_task_id: str | None = None
+    custom_task_id: str | None = None
 
 
 class QuestionImportRow(BaseModel):
-    """Una entrada de questions.json."""
+    """An entry from questions.json.
+
+    `question_key` is the stable key (e.g. "p41") to reference this
+    question later from `features.jsonl` (`type=load`) — assign it if
+    you're going to need that; never use the internal Postgres
+    `question_id` for that, it changes on every reload of
+    `questions.json`."""
 
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "text": "¿La solución usa recursión?",
+                "text": "Does the solution use recursion?",
                 "kind": "binary",
                 "lo": 0,
                 "hi": 1,
                 "author": "marcos",
                 "version": "v1",
+                "question_key": "p1",
                 "script": None,
             }
         }
     )
 
     text: str
-    # binary: pregunta de sí/no (0-1). numeric: valor numérico (entero o decimal).
+    # binary: yes/no question (0-1). numeric: numeric value (integer or decimal).
     kind: Literal["binary", "numeric"]
     lo: float | None = None
     hi: float | None = None
     author: str | None = None
     version: str | None = None
-    # None: la pregunta se resuelve con el LLM. Con valor: función Python
-    # completa, firma fija `def task_func(task_prompt: str) -> float` (mismo
-    # nombre que usa BigCodeBench como entry_point); se ejecuta con el
-    # prompt de la tarea como único input (sin LLM, costo 0).
+    question_key: str | None = None
+    # None: the question is resolved by the LLM. With a value: full Python
+    # function, fixed signature `def task_func(task_prompt: str) -> float`
+    # (same name BigCodeBench uses as entry_point); it's executed with the
+    # task's prompt as its only input (no LLM, cost 0).
     script: str | None = None
+    # Times to repeat the LLM call and average (simple mean) the result.
+    # Ignored for a script question (always computed once, deterministic).
+    repetitions: int = 1
 
 
 class ModelImportRow(BaseModel):
-    """Una entrada de models.json."""
+    """An entry from models.json."""
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -93,27 +113,34 @@ class ModelImportRow(BaseModel):
     )
 
     name: str
-    # api: se llama por HTTP a un proveedor externo. hosted: se factura por tiempo de cómputo propio.
+    # api: called over HTTP to an external provider. hosted: billed by its own compute time.
     type: Literal["api", "hosted"]
     provider: str | None = None
     endpoint: str | None = None
     deployment: str | None = None
-    # Nombre de la variable de entorno a usar para ESTE modelo (permite tener
-    # varias keys del mismo provider, ej. dos cuentas de OpenAI). None = usar
-    # la convención fija por provider (ver .env.example).
+    # Name of the environment variable to use for THIS model (allows having
+    # several keys for the same provider, e.g. two OpenAI accounts). None =
+    # use the fixed per-provider convention (see .env.example).
     api_key_env: str | None = None
     in_token_price: float | None = None
     out_token_price: float | None = None
     cost_per_second: float | None = None
-    # Máximo de llamadas simultáneas a este modelo. None = sin límite definido.
+    # Maximum simultaneous calls to this model. None = no limit defined.
     concurrency: int | None = None
-    # Timeout de la llamada HTTP a este modelo, en segundos.
+    # Timeout of the HTTP call to this model, in seconds.
     timeout_seconds: int = 300
-    # Temperatura a usar al llamar este modelo (config por modelo, no por
-    # request). None = default del proveedor.
+    # Temperature to use when calling this model (per-model config, not
+    # per-request). None = provider default.
     temperature: float | None = None
-    # candidate: se rutea/genera soluciones con él (puede haber varios
-    # activos a la vez). feature: calcula features vía LLM. judge: califica
-    # soluciones de tareas custom. Solo puede haber UN model activo con
-    # role='feature' y UN model activo con role='judge' a la vez.
+    # chat_completions (default): litellm.completion(). responses: OpenAI's
+    # new API (litellm.responses()) — needed by models that don't fully
+    # expose Chat Completions.
+    api_kind: Literal["chat_completions", "responses"] = "chat_completions"
+    # Maximum output tokens to request from the model. None = not sent.
+    # Some APIs require it (e.g. Anthropic Messages).
+    max_tokens: int | None = None
+    # candidate: solutions are routed to/generated with it (several can be
+    # active at once). feature: computes features via LLM. judge: grades
+    # solutions of custom tasks. There can only be ONE active model with
+    # role='feature' and ONE active model with role='judge' at a time.
     role: Literal["candidate", "feature", "judge"]

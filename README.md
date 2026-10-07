@@ -1,99 +1,116 @@
 # RouterKit
 
-**RouterKit** es una plataforma para entrenar y servir un *router* de LLMs para tareas de programación: dado un catálogo de tareas de código, genera soluciones con distintos LLMs candidatos, las evalúa (tests reales vía [BigCodeBench](https://github.com/bigcode-project/bigcodebench) o un juez LLM), agrega los resultados como dataset de entrenamiento, y (a futuro) entrena un predictor que elige en producción qué LLM conviene usar para una tarea nueva, balanceando calidad vs. costo.
+**RouterKit** is a platform for training and serving an LLM *router* for programming tasks: given a catalog of coding tasks, it generates solutions with different candidate LLMs, evaluates them (real tests via [BigCodeBench](https://github.com/bigcode-project/bigcodebench) or an LLM judge), aggregates the results as a training dataset, and (eventually) trains a predictor that picks, in production, which LLM is best suited for a new task, balancing quality vs. cost.
 
-> **Estado**: el pipeline de datos (catálogos → features → generación → evaluación → agregación) está completo y funcional. El entrenamiento del predictor (AutoML), la política de ruteo en producción y la exportación de resultados todavía **no están implementados** — ver [Estado actual y roadmap](#estado-actual-y-roadmap).
+> **Status**: the data pipeline (catalogs → features → generation → evaluation → aggregation) is complete and functional. Predictor training (AutoML), the production routing policy, and result export are **not implemented yet** — see [Current status and roadmap](#current-status-and-roadmap).
 
-## Tabla de contenidos
+## Table of contents
 
-- [Arquitectura](#arquitectura)
+- [Architecture](#architecture)
 - [Quick start](#quick-start)
-- [Conceptos clave](#conceptos-clave)
-- [Pipeline end-to-end](#pipeline-end-to-end)
-- [Modelo de datos](#modelo-de-datos)
-- [Configuración](#configuración)
-- [Estructura del repo](#estructura-del-repo)
-- [Estado actual y roadmap](#estado-actual-y-roadmap)
+- [Key concepts](#key-concepts)
+- [End-to-end pipeline](#end-to-end-pipeline)
+- [Data model](#data-model)
+- [Configuration](#configuration)
+- [Repo structure](#repo-structure)
+- [Current status and roadmap](#current-status-and-roadmap)
 
-## Arquitectura
+## Architecture
 
-Tres servicios orquestados con `docker-compose`:
+Three services orchestrated with `docker-compose`:
 
 ```mermaid
 flowchart LR
-    U["Usuario / cliente HTTP"] -->|"tasks.jsonl, questions.json,<br/>models.json, requests"| API["routerkit-api<br/>(FastAPI, orquestador)"]
-    API -->|"bcb_task_id + código"| BCB["bigcodebench-api<br/>(sandbox de BigCodeBench)"]
-    API -->|"SQL"| PG[("postgres<br/>schema routerkit")]
-    API -->|"chat completions"| LLM["Proveedores LLM<br/>(OpenAI, Anthropic, ...)"]
-    API -->|"snapshots JSON"| DATA[("./data<br/>bind mount")]
+    U["User / HTTP client"] -->|"tasks.jsonl, questions.json,<br/>models.json, requests"| API["routerkit-api<br/>(FastAPI, orchestrator)"]
+    API -->|"bcb_task_id + code"| BCB["bigcodebench-api<br/>(BigCodeBench sandbox)"]
+    API -->|"SQL"| PG[("postgres<br/>routerkit schema")]
+    API -->|"chat completions"| LLM["LLM providers<br/>(OpenAI, Anthropic, ...)"]
+    API -->|"JSON snapshots"| DATA[("./data<br/>bind mount")]
 ```
 
-- **`routerkit-api`**: FastAPI. Dueño de toda la lógica de negocio y del schema de Postgres. Único punto de entrada HTTP para el usuario.
-- **`bigcodebench-api`**: wrapper HTTP fino sobre el paquete `bigcodebench` (imagen oficial `bigcodebench/bigcodebench-evaluate`). Corre `untrusted_check` (el sandbox real, con límites de recursos) para una sola `(bcb_task_id, solución)` a la vez, vía un patrón job/polling. Sin puerto publicado al host: solo accesible desde `routerkit-api`, por red interna.
-- **`postgres`**: un único schema `routerkit`. No hay concepto de "experimento": todo el sistema opera siempre sobre **lo activo** (ver [Conceptos clave](#conceptos-clave)).
+- **`routerkit-api`**: FastAPI. Owns all the business logic and the Postgres schema. The only HTTP entry point for the user.
+- **`bigcodebench-api`**: a thin HTTP wrapper around the `bigcodebench` package (official `bigcodebench/bigcodebench-evaluate` image). Runs `untrusted_check` (the real sandbox, with resource limits) for a single `(bcb_task_id, solution)` at a time, via a job/polling pattern. No port published to the host: only reachable from `routerkit-api`, over the internal network.
+- **`postgres`**: a single `routerkit` schema. No "experiment" concept: the whole system always operates on **what's active** (see [Key concepts](#key-concepts)).
 
 ## Quick start
 
 ```bash
 cp .env.example .env
-# completar al menos una API key (OPENAI_API_KEY, ANTHROPIC_API_KEY, ...)
+# fill in at least one API key (OPENAI_API_KEY, ANTHROPIC_API_KEY, ...)
 
 docker compose up --build
 ```
 
-Al arrancar, `routerkit-api` corre sobre Postgres y expone `http://localhost:8000` (Swagger UI en `/docs`). La primera vez que la base de datos está vacía, **precarga automáticamente el catálogo oficial de BigCodeBench** (1140 tareas, ver [`data/seed/`](data/seed/)) — no hace falta ningún paso manual para tener tareas disponibles.
+On startup, `routerkit-api` runs against Postgres and exposes `http://localhost:8000` (Swagger UI at `/docs`). The first time the database is empty, it **automatically preloads the official BigCodeBench catalog** (1135 tasks — the full dataset has 1140, but 5 were excluded because their tests depend on web pages that no longer exist, see [`data/examples/tasks_exp.jsonl`](data/examples/tasks_exp.jsonl)) — no manual step is needed to have tasks available.
 
-Para empezar a generar y evaluar soluciones hace falta además cargar preguntas de features y modelos candidatos:
+To start generating and evaluating solutions you also need to load feature questions and candidate models:
 
 ```bash
 curl -X POST localhost:8000/questions/import -F file=@data/examples/questions.json
 curl -X POST localhost:8000/models/import     -F file=@data/examples/models.json
 ```
 
-Y opcionalmente reemplazar el catálogo de tareas por uno propio (custom, benchmark oficial, o mezclado — ver [`TaskImportRow`](routerkit-api/app/schemas.py)):
+And optionally replace the task catalog with your own (custom, official benchmark, or mixed — see [`TaskImportRow`](routerkit-api/app/schemas.py)):
 
 ```bash
 curl -X POST localhost:8000/tasks/import -F file=@data/examples/tasks.jsonl
 ```
 
-## Conceptos clave
+### `data/examples/`
 
-- **Sin tabla de "experimentos"**: no hay corridas paralelas ni scoping por experimento. Cada recarga de un catálogo (tasks/questions/models) o recálculo (features/solutions/grades/targets/model_metrics) sigue siempre el mismo patrón: **desactivar lo anterior, activar lo nuevo** (`active BOOLEAN`, borrado lógico). Cuando se desactiva una fila "de origen" (una task, un model), la desactivación cae en cascada hacia todo lo que se calculó a partir de ella (ver [`app/services/cascade.py`](routerkit-api/app/services/cascade.py)). Ningún endpoint de lectura histórica existe a propósito — para ver datos desactivados, se consulta Postgres directo.
-- **Procesos largos = jobs async persistidos**: `features/compute`, `solutions/generate` y `solutions/validate` corren en background (Postgres, no en memoria — sobreviven a un restart del container) y devuelven 202 al instante. `GET /jobs` muestra el estado de la fila activa de cada tipo (`empty` | `running` | `idle` con `last_result`), en un solo request. 409 si ya hay un job de ese mismo tipo corriendo.
-- **Concurrencia acotada por modelo**: cada `model.concurrency` limita cuántas llamadas a ESE modelo pueden estar en vuelo a la vez (`ThreadPoolExecutor`, ver [`app/services/concurrency.py`](routerkit-api/app/services/concurrency.py)). La única excepción es la evaluación contra `bigcodebench-api`, que corre **secuencial** a propósito (ya es un job de fondo; no tiene sentido paralelizar contra un servicio que además ya tiene su propio límite interno).
-- **Probabilidad calibrada vía logprobs, solo donde corresponde**: las features LLM (`kind=binary`/`numeric`) usan `exp(logprob)` del primer token de la respuesta para obtener una probabilidad calibrada en vez de un simple sí/no. El juez LLM (`services/judge.py`), en cambio, es puramente binario (`passed: bool`) — sin logprobs ni probabilidad — igual que el veredicto de `bigcodebench-api`.
-- **`has_error` explícito**: en `solutions` y `grades`, un fallo de infraestructura (la llamada al LLM falló, `bigcodebench-api` no respondió, timeout) se marca con `has_error=true`, **distinto** de un resultado negativo legítimo (`passed=false`, con su `fail_reason`). Ninguno de los dos aborta el resto del lote que se estaba procesando.
-- **Snapshots en disco**: cada recarga/recálculo deja un JSON con el estado activo resultante en `data/current/<nombre>.json`, rotando el anterior a `data/previous/<nombre>.json` (un solo paso atrás, no historial completo). `./data` es un bind mount (no un volumen Docker con nombre), así que es visible/editable directo desde el host.
+There's one example file per upload the system accepts, and all of them travel as `.jsonl` (one JSON row per line) via `multipart` — `tasks.jsonl`, `questions.json`†, `models.json`†, and `features.jsonl`, `solutions.jsonl`, `validations.jsonl` for `type=load` of `/features/compute`, `/solutions/generate`, and `/solutions/validate` respectively (`type` and the rest of the parameters go as query params, not in the body — see the example `curl` below):
 
-## Pipeline end-to-end
+```bash
+curl -X POST "localhost:8000/solutions/generate?type=load" -F file=@data/examples/solutions.jsonl
+curl -X POST "localhost:8000/solutions/validate?type=load" -F file=@data/examples/validations.jsonl
+```
+
+† `questions.json`/`models.json` are the exception: they stay a single JSON object (`{"questions": [...]}` / `{"models": [...]}`), because they're small catalogs (dozens of rows) where JSONL's scalability isn't needed — unlike `tasks`/`features`/`solutions`/`validations`, which in a real run scale to thousands of rows.
+
+Tasks in `type=load` files are identified by `bcb_task_id` (benchmark) or `custom_task_id` (custom) — never by the internal Postgres `task_id`, which isn't stable across reloads. `question_id`/`model_name` need to match the real ones that exist in your database at the time you load them.
+
+Full field-by-field guide for each file (allowed values, which ones are required, how to build your own `*_exp`): [`data/examples/README.md`](data/examples/README.md).
+
+The `*_exp.json`/`*_exp.jsonl` files (e.g. `tasks_exp.jsonl`, `questions_exp.json`) are, instead, the actual data used in the experiment (not a minimal example) — `tasks_exp.jsonl` is the complete BigCodeBench dataset (the same one that's preloaded at startup); the others get added by the team as the experiment runs.
+
+## Key concepts
+
+- **No "experiments" table**: there are no parallel runs or experiment-based scoping. Every catalog reload (tasks/questions/models) or recomputation (features/solutions/grades/targets/model_metrics) always follows the same pattern: **deactivate the old, activate the new** (`active BOOLEAN`, logical deletion). When a "source" row is deactivated (a task, a model), the deactivation cascades to everything computed from it (see [`app/services/cascade.py`](routerkit-api/app/services/cascade.py)). No historical-read endpoint exists on purpose — to see deactivated data, you query Postgres directly.
+- **Long-running processes = persisted async jobs**: `features/compute`, `solutions/generate`, and `solutions/validate` run in the background (Postgres, not in memory — they survive a container restart) and return 202 instantly. `GET /jobs` shows the active row's status for each kind (`empty` | `running` | `idle` with `last_result`), in a single request. 409 if a job of that same kind is already running.
+- **Concurrency bounded per model**: each `model.concurrency` limits how many calls to THAT model can be in flight at once (`ThreadPoolExecutor`, see [`app/services/concurrency.py`](routerkit-api/app/services/concurrency.py)). The one exception is evaluation against `bigcodebench-api`, which deliberately runs **sequentially** (it's already a background job; there's no point parallelizing against a service that already has its own internal limit).
+- **Logprob-calibrated probability, only where it applies**: LLM features (`kind=binary`/`numeric`) use `exp(logprob)` of the response's first token to get a calibrated probability instead of a plain yes/no. The LLM judge (`services/judge.py`), by contrast, is purely binary (`passed: bool`) — no logprobs, no probability — same as the verdict from `bigcodebench-api`.
+- **Explicit `has_error`**: in `solutions` and `grades`, an infrastructure failure (the LLM call failed, `bigcodebench-api` didn't respond, timeout) is flagged with `has_error=true`, **distinct** from a legitimate negative result (`passed=false`, with its `fail_reason`). Neither one aborts the rest of the batch being processed.
+- **Snapshots on disk**: every reload/recomputation leaves a JSON with the resulting active state at `data/current/<name>.json`, rotating the previous one to `data/previous/<name>.json` (a single step back, not a full history). `./data` is a bind mount (not a named Docker volume), so it's visible/editable directly from the host.
+
+## End-to-end pipeline
 
 ```mermaid
 flowchart TD
-    A["Catálogos<br/>tasks / questions / models"] --> B["features/compute<br/>(LLM o script Python)"]
-    A --> C["solutions/generate<br/>(LLM candidato)"]
-    C --> D["solutions/validate<br/>(bigcodebench-api o juez LLM)"]
+    A["Catalogs<br/>tasks / questions / models"] --> B["features/compute<br/>(LLM or Python script)"]
+    A --> C["solutions/generate<br/>(candidate LLM)"]
+    C --> D["solutions/validate<br/>(bigcodebench-api or LLM judge)"]
     B --> E["aggregate<br/>(targets + model_metrics)"]
     D --> E
-    E --> F["train<br/>(AutoML, PENDIENTE)"]
-    F --> G["route<br/>(producción, PENDIENTE)"]
+    E --> F["train<br/>(AutoML, PENDING)"]
+    F --> G["route<br/>(production, PENDING)"]
 ```
 
-| Paso | Endpoint | Async | Descripción |
+| Step | Endpoint | Async | Description |
 |---|---|:-:|---|
-| Catálogos | `POST /tasks/import`, `/questions/import`, `/models/import` | No | Reemplazo (borrado lógico) del catálogo correspondiente, vía archivo `multipart`. |
-| Features | `POST /features/compute` | Sí | Para TODAS las tasks × questions activas: preguntas con `script` → Python local; sin `script` → el único model `role=feature` activo. |
-| Generación | `POST /solutions/generate` | Sí | `type=calculate`: genera con TODOS los models `role=candidate` activos, `n_samples` por task. `type=load`: inserta soluciones ya calculadas afuera. |
-| Evaluación | `POST /solutions/validate` | Sí | Agrupa las solutions activas por `task.bcb_task_id`: con valor → `bigcodebench-api` (secuencial); sin valor → el único model `role=judge` activo (concurrente). `type=load` también disponible. |
-| Agregación | `POST /aggregate` | No | Recalcula `targets` (pass_rate por task+model) y `model_metrics` (agregado por model) a partir de solutions/grades activas. |
-| Entrenamiento | `POST /train` | No | **Stub** (501) — ver roadmap. |
-| Ruteo | `POST /route` | No | **Stub** (501) — ver roadmap. |
-| Jobs | `GET /jobs` | — | Estado de la fila activa de cada job async conocido. |
+| Catalogs | `POST /tasks/import`, `/questions/import`, `/models/import` | No | Replaces (logical delete) the corresponding catalog, via a `multipart` file. |
+| Features | `POST /features/compute` | Yes | `type=calculate`: for ALL active tasks × questions, questions with `script` → local Python, without `script` → the single active `role=feature` model. `type=load`: inserts features already computed externally. |
+| Generation | `POST /solutions/generate` | Yes | `type=calculate`: generates with ALL active `role=candidate` models, `n_samples` per task. `type=load`: inserts solutions already computed externally. |
+| Evaluation | `POST /solutions/validate` | Yes | Groups active solutions by `task.bcb_task_id`: with a value → `bigcodebench-api` (sequential); without one → the single active `role=judge` model (concurrent). `type=load` also available. |
+| Aggregation | `POST /aggregate` | No | Recomputes `targets` (pass_rate per task+model) and `model_metrics` (aggregated per model) from active solutions/grades. |
+| Training | `POST /train` | No | **Stub** (501) — see roadmap. |
+| Routing | `POST /route` | No | **Stub** (501) — see roadmap. |
+| Jobs | `GET /jobs` | — | Status of the active row for each known async job kind. |
 
-Todos los endpoints de import/cómputo/generación/evaluación son **bulk-only**: no existen equivalentes de "un solo registro" (ej. no hay `POST /solutions/{id}/evaluate`) — todo proceso identifica por sí mismo qué filas activas tiene que procesar.
+All import/compute/generation/evaluation endpoints are **bulk-only**: there are no "single record" equivalents (e.g. there's no `POST /solutions/{id}/evaluate`) — every process identifies on its own which active rows it needs to process.
 
-## Modelo de datos
+## Data model
 
-Un único schema Postgres (`routerkit`), sin tabla de experimentos:
+A single Postgres schema (`routerkit`), with no experiments table:
 
 ```
 tasks ──┬──> features <── questions
@@ -101,56 +118,56 @@ tasks ──┬──> features <── questions
         └──> targets <──────────────┐
 models ─┼──> solutions               │
         ├──> targets ────────────────┤
-        └──> model_metrics <── (agregado de targets + solutions)
+        └──> model_metrics <── (aggregated from targets + solutions)
 
 targets + features ──> predictors ──> route_decisions
 ```
 
-- **`tasks`**: `bcb_task_id` decide el tipo *por fila*: con valor (`"BigCodeBench/12"`) es una tarea oficial del benchmark (se evalúa 100% dentro de `bigcodebench-api`); sin valor es custom (se evalúa con el juez LLM).
-- **`questions`**: preguntas de features, `kind=binary|numeric`; con `script` se resuelven en Python local (costo 0), sin `script` vía LLM.
-- **`models`**: `role=candidate` (genera/rutea soluciones, pueden convivir varios activos con `name` distinto), `feature` o `judge` (a lo sumo uno activo de cada uno).
-- **`solutions`** / **`grades`**: 1 fila por intento de generación / su veredicto (relación 1:1).
-- **`targets`** / **`model_metrics`**: agregados recalculados por completo en cada `POST /aggregate`.
-- **`predictors`** / **`route_decisions`**: destino del entrenamiento y del ruteo en producción (aún no poblados — ver roadmap).
-- **`jobs`**: seguimiento de los procesos async (persistido en Postgres, no en memoria).
+- **`tasks`**: `bcb_task_id` decides the type *per row*: with a value (`"BigCodeBench/12"`) it's an official benchmark task (evaluated 100% inside `bigcodebench-api`); without one it's custom (evaluated with the LLM judge). `custom_task_id` is the equivalent stable key for custom tasks (assigned by the user) — none of the `type=load` paths ever reference the internal Postgres `task_id`, which isn't stable across reloads.
+- **`questions`**: feature questions, `kind=binary|numeric`; with `script` they're resolved locally in Python (cost 0), without `script` via LLM. `question_key` is their stable key (assigned by the user) to reference them from `features` `type=load`.
+- **`models`**: `role=candidate` (generates/routes solutions, several can be active at once with distinct `name`), `feature` or `judge` (at most one active of each).
+- **`solutions`** / **`grades`**: 1 row per generation attempt / its verdict (1:1 relationship).
+- **`targets`** / **`model_metrics`**: aggregates fully recomputed on every `POST /aggregate`.
+- **`predictors`** / **`route_decisions`**: destination of training and of production routing (not populated yet — see roadmap).
+- **`jobs`**: tracking of async processes (persisted in Postgres, not in memory).
 
-El DDL completo, con el razonamiento de cada decisión documentado inline, está en [`postgres/init/001_schema.sql`](postgres/init/001_schema.sql).
+The complete DDL, with the reasoning behind each decision documented inline, is in [`postgres/init/001_schema.sql`](postgres/init/001_schema.sql).
 
-## Configuración
+## Configuration
 
-Variables de entorno (`.env`, ver [`.env.example`](.env.example)):
+Environment variables (`.env`, see [`.env.example`](.env.example)):
 
-| Variable | Uso |
+| Variable | Use |
 |---|---|
-| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Credenciales de Postgres. |
-| `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `AZURE_OPENAI_API_KEY` (+ `AZURE_OPENAI_API_VERSION`), `OPENROUTER_API_KEY`, `CUSTOM_LLM_API_KEY` | Convención fija de key por `provider`. |
-| `OPENAI_API_KEY_2`, etc. | Cuentas adicionales del mismo proveedor — cada `model` en `models.json` puede apuntar a una variable propia vía `api_key_env`. |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Postgres credentials. |
+| `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `AZURE_OPENAI_API_KEY` (+ `AZURE_OPENAI_API_VERSION`), `OPENROUTER_API_KEY`, `CUSTOM_LLM_API_KEY` | Fixed key convention per `provider`. |
+| `OPENAI_API_KEY_2`, etc. | Additional accounts for the same provider — each `model` in `models.json` can point to its own variable via `api_key_env`. |
 
-`routerkit-api` resuelve el proveedor/deployment/temperatura/timeout/concurrencia por fila de `models` (vía [`litellm`](https://github.com/BerriAI/litellm)), no por request — ver el ejemplo en [`data/examples/models.json`](data/examples/models.json).
+`routerkit-api` resolves provider/deployment/temperature/timeout/concurrency per `models` row (via [`litellm`](https://github.com/BerriAI/litellm)), not per request — see the example in [`data/examples/models.json`](data/examples/models.json).
 
-## Estructura del repo
+## Repo structure
 
 ```
 routerkit/
 ├── docker-compose.yml
 ├── .env.example
 ├── postgres/
-│   └── init/001_schema.sql        # DDL completo, comentado
+│   └── init/001_schema.sql        # full, commented DDL
 ├── bigcodebench-api/
 │   ├── Dockerfile                 # FROM bigcodebench/bigcodebench-evaluate
 │   └── app/
 │       ├── main.py                # POST /jobs, GET /jobs/{id}
-│       ├── jobs.py                # jobs en memoria + threadpool
+│       ├── jobs.py                # in-memory jobs + threadpool
 │       ├── evaluator.py           # get_bigcodebench() + untrusted_check()
 │       └── schemas.py
 ├── routerkit-api/
 │   └── app/
-│       ├── main.py                # lifespan: reset de jobs + seed de tasks
+│       ├── main.py                # lifespan: job reset + task seeding
 │       ├── config.py
 │       ├── schemas.py             # *ImportRow (tasks/questions/models)
 │       ├── db/
 │       │   ├── base.py
-│       │   └── models.py          # ORM 1:1 con el schema SQL
+│       │   └── models.py          # ORM 1:1 with the SQL schema
 │       ├── clients/
 │       │   ├── llm_client.py      # litellm + normalize_yes_no/logprobs
 │       │   └── bigcodebench_client.py
@@ -158,30 +175,30 @@ routerkit/
 │       │   ...                     # evaluation, aggregation, training,
 │       │   ...                     # routing, jobs
 │       └── services/
-│           ├── cascade.py          # borrado lógico en cascada
+│           ├── cascade.py          # cascading logical deletion
 │           ├── concurrency.py      # run_bounded (ThreadPoolExecutor)
-│           ├── jobs.py             # jobs async persistidos en Postgres
+│           ├── jobs.py             # async jobs persisted in Postgres
 │           ├── snapshots.py        # data/current + data/previous
-│           ├── seed.py             # precarga de tasks_bigcodebench.jsonl
-│           ├── tasks_catalog.py    # reemplazo de tasks (import + seed)
+│           ├── seed.py             # preloads tasks_exp.jsonl at startup
+│           ├── tasks_catalog.py    # task replacement (import + seed)
 │           ├── features_llm.py / features_python.py
-│           ├── generation.py       # generación de soluciones
-│           ├── judge.py            # juez LLM (tareas custom)
+│           ├── generation.py       # solution generation
+│           ├── judge.py            # LLM judge (custom tasks)
 │           ├── aggregation.py      # targets + model_metrics
 │           └── training.py         # STUB
 └── data/
-    ├── examples/                   # tasks.jsonl, questions.json, models.json
-    ├── seed/                       # tasks_bigcodebench.jsonl (dataset oficial)
-    ├── current/                    # snapshots vigentes (runtime, gitignored)
-    └── previous/                   # snapshot anterior (runtime, gitignored)
+    ├── examples/                   # one minimal example per upload, plus
+    │                                # the real *_exp.json(l) experiment data
+    ├── current/                    # current snapshots (runtime, gitignored)
+    └── previous/                   # previous snapshot (runtime, gitignored)
 ```
 
-## Estado actual y roadmap
+## Current status and roadmap
 
-**Completo y funcional**: catálogos (con precarga automática del benchmark oficial), features (LLM + Python), generación de soluciones, evaluación (bigcodebench-api + juez LLM), agregación de targets/model_metrics, jobs async.
+**Complete and functional**: catalogs (with automatic preloading of the official benchmark), features (LLM + Python), solution generation, evaluation (bigcodebench-api + LLM judge), targets/model_metrics aggregation, async jobs.
 
-**Pendiente** (lo que sigue):
+**Pending** (what's next):
 
-- **Entrenamiento del predictor** (`services/training.py`, `POST /train`): armar el dataset largo desde `features`/`targets` activos, elegir/correr AutoML, serializar el artefacto bajo `ARTIFACTS_DIR` y registrar el `predictor` en Postgres.
-- **Política de ruteo en producción** (`services/routing.py` — no existe todavía, hoy vive como stub dentro de `routers/routing.py`, `POST /route`): calcular features en vivo para un prompt nuevo, puntuar cada candidato con el predictor productivo, y elegir ganador balanceando calidad vs. costo (λ, `p_min`, exclusiones, fallback — parámetros aún no definidos).
-- **Exportación de resultados**: todavía no hay un formato/endpoint definido para exportar el dataset de entrenamiento o los resultados del ruteo hacia afuera del sistema.
+- **Predictor training** (`services/training.py`, `POST /train`): build the long-format dataset from active `features`/`targets`, choose/run AutoML, serialize the artifact under `ARTIFACTS_DIR`, and register the `predictor` in Postgres.
+- **Production routing policy** (`services/routing.py` — doesn't exist yet, today it lives as a stub inside `routers/routing.py`, `POST /route`): compute live features for a new prompt, score each candidate with the production predictor, and pick a winner balancing quality vs. cost (λ, `p_min`, exclusions, fallback — parameters not defined yet).
+- **Result export**: there's no format/endpoint defined yet to export the training dataset or routing results out of the system.

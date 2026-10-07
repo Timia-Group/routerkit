@@ -3,9 +3,35 @@ __pycache__/
 *.pyc
 .venv/
 
-# Generados en runtime por app/services/snapshots.py (bind mount de
-# routerkit-api, ver docker-compose.yml). data/examples/ y data/seed/ sí
-# se versionan (este último trae el dataset de BigCodeBench, ver
+# Generated at runtime by app/services/snapshots.py (bind mount of
+# routerkit-api, see docker-compose.yml). data/examples/ IS versioned
+# (includes tasks_exp.jsonl, the BigCodeBench dataset preloaded by
 # app/services/seed.py).
 /data/current/
 /data/previous/
+
+# solutions_exp / validations_exp: actual experiment results, very heavy
+# (hundreds of MB) — the raw .jsonl is never committed (it's regenerable),
+# and the .jsonl.gz is ignored ON PURPOSE until it's the FINAL published
+# version (not edited again afterward). For that one-time commit:
+# `git add -f data/examples/solutions_exp.jsonl.gz
+#  data/examples/validations_exp.jsonl.gz`
+# — never via `git add -A`/`git add .`, precisely to avoid accidentally
+# committing an intermediate version.
+/data/examples/solutions_exp.jsonl
+/data/examples/validations_exp.jsonl
+/data/examples/solutions_exp.jsonl.gz
+/data/examples/validations_exp.jsonl.gz
+
+# Scratch file for the user's own tests (real test credentials/endpoints)
+# — never committed, deleted once testing is done.
+/data/examples/models_exp2.json
+
+# Same reason: has a real internal Azure hostname for gpt-5.4 (not a
+# secret, but still an internal resource — no reason to leave it in git
+# history).
+/data/examples/models_exp.json
+
+# Trained predictor artifacts (.joblib) — regenerable via POST /train,
+# same reasoning as solutions_exp/validations_exp above.
+/data/predictors/

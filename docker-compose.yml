@@ -20,8 +20,8 @@ services:
 
   bigcodebench-api:
     build: ./bigcodebench-api
-    # Sin puertos publicados al host: solo accesible desde routerkit-api,
-    # vía la red interna, por diseño.
+    # No ports published to the host: only accessible from routerkit-api,
+    # via the internal network, by design.
     networks:
       - routerkit-net
     restart: unless-stopped
@@ -42,10 +42,11 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      # Bind mount (no named volume): así el usuario ve/edita los archivos
-      # directo en ./data desde su computadora, sin entrar al container.
-      # ./data/examples ya trae ejemplos; el container escribe
-      # data/current y data/previous ahí mismo (ver app/services/snapshots.py).
+      # Bind mount (not a named volume): this way the user can see/edit
+      # the files directly in ./data from their computer, without entering
+      # the container. ./data/examples already has examples; the container
+      # writes data/current and data/previous there too (see
+      # app/services/snapshots.py).
       - ./data:/data/artifacts
     networks:
       - routerkit-net

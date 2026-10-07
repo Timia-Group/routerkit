@@ -6,3 +6,28 @@ pydantic-settings>=2.2,<3.0
 httpx>=0.27,<1.0
 python-multipart>=0.0.9,<1.0
 litellm>=1.50,<2.0
+
+# Predictor training (services/training.py): fixed algorithm
+# (GradientBoostingRegressor), no AutoML library, no user-facing choice.
+scikit-learn>=1.5,<2.0
+pandas>=2.2,<3.0
+joblib>=1.4,<2.0
+
+# Routing lambda calibration (services/routing_calibration.py): automatic
+# elbow detection on the Monte Carlo cost/accuracy sweep.
+kneed>=0.8,<1.0
+
+# Training report charts (services/reports.py): standalone interactive
+# HTML (fully self-contained, no CDN/network needed to view them) plus a
+# static PNG per chart (kaleido) for sharing/embedding wherever an
+# interactive page isn't practical.
+plotly>=5.20,<6.0
+kaleido>=0.2,<0.3
+
+# Not used by routerkit-api itself — these exist only so that
+# questions.script (exec'd by app/services/features_python.py) has them
+# available. If your own question scripts need something else, add it
+# here too (see data/examples/README.md, "Available packages").
+nltk>=3.8,<4.0
+numpy>=1.26,<3.0
+tiktoken>=0.7,<1.0

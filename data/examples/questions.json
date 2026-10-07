@@ -1,29 +1,99 @@
 {
   "questions": [
     {
-      "text": "¿La solución esperada probablemente use recursión?",
+      "text": "Length of the statement in tokens. Calculation: len(tokenizer.encode(prompt)).",
+      "kind": "numeric",
+      "lo": null,
+      "hi": null,
+      "author": "Timia",
+      "version": "v1",
+      "script": "def task_func(task_prompt: str) -> float:\n    import re\n    import tiktoken\n    enc = tiktoken.get_encoding(\"cl100k_base\")\n    return float(len(enc.encode(task_prompt)))",
+      "question_key": "q1"
+    },
+    {
+      "text": "Does the statement explicitly say what to do when the input is empty? Answer Yes or No.",
       "kind": "binary",
       "lo": 0,
       "hi": 1,
-      "author": "example",
-      "version": "v1"
-    },
-    {
-      "text": "¿Qué tan difícil es la tarea, del 1 (trivial) al 10 (muy difícil)?",
-      "kind": "numeric",
-      "lo": 1,
-      "hi": 10,
-      "author": "example",
-      "version": "v1"
-    },
-    {
-      "text": "¿Cuántas líneas tiene el prompt de la tarea?",
-      "kind": "numeric",
-      "lo": 1,
-      "hi": 200,
-      "author": "example",
+      "author": "Timia",
       "version": "v1",
-      "script": "def task_func(task_prompt: str) -> float:\n    return float(len(task_prompt.splitlines()))"
+      "question_key": "q15"
+    },
+    {
+      "text": "Number of parenthetical asides in the text excluding code. Calculation: len(re.findall(r'\\([^)]{3,}\\)', text_without_code_blocks)). Proxy for clarifications and nuances added to the specification.",
+      "kind": "numeric",
+      "lo": null,
+      "hi": null,
+      "author": "Timia",
+      "version": "v1",
+      "script": "def task_func(task_prompt: str) -> float:\n    import re\n    m = re.search(r\"```(?:python)?\\n(.*?)```\", task_prompt, re.DOTALL)\n    t = task_prompt[:m.start()] if m else task_prompt\n    return float(len(re.findall(r\"\\([^)]{3,}\\)\", t)))",
+      "question_key": "q34"
+    },
+    {
+      "text": "How many distinct libraries would a reasonable solution import? Answer with a single integer.",
+      "kind": "numeric",
+      "lo": 0,
+      "hi": 10,
+      "author": "Timia",
+      "version": "v1",
+      "question_key": "q80"
+    },
+    {
+      "text": "Number of words in the statement.",
+      "kind": "numeric",
+      "lo": null,
+      "hi": null,
+      "author": "Timia",
+      "version": "v1",
+      "script": "def task_func(task_prompt: str) -> float:\n    import re\n    m = re.search(r\"```(?:python)?\\n(.*?)```\", task_prompt, re.DOTALL)\n    t = task_prompt[:m.start()] if m else task_prompt\n    return float(len(re.findall(r\"[A-Za-z']+\", t)))",
+      "question_key": "q60"
+    },
+    {
+      "text": "Returns 1 if the task requires processing multiple elements of a collection, records, rows, files or results. It doesn't matter whether a concrete implementation would use a loop, comprehension, vectorization or a library function. Returns 0 when there is no repeated processing of elements.",
+      "kind": "binary",
+      "lo": 0,
+      "hi": 1,
+      "author": "Timia",
+      "version": "v1",
+      "question_key": "q64"
+    },
+    {
+      "text": "Rate the difficulty of this task for an automated code generator from 0 (trivial) to 100 (extremely hard). Answer with a single integer.",
+      "kind": "numeric",
+      "lo": 0,
+      "hi": 100,
+      "author": "Timia",
+      "version": "v1",
+      "question_key": "q73",
+      "repetitions": 2
+    },
+    {
+      "text": "Does the task require pattern-based text parsing, such as regular expressions? Answer Yes or No.",
+      "kind": "binary",
+      "lo": 0,
+      "hi": 1,
+      "author": "Timia",
+      "version": "v1",
+      "question_key": "q79"
+    },
+    {
+      "text": "Ratio of sentences that start in imperative mood (action verb at the start: Extract, Generate, Compute, Create, Return, Convert, Parse, Read, Write, Check, Validate, Find, Count, Remove, Add, Merge, Split, Filter, Sort, Build, Plot, Load, Save) over the total sentences in the statement excluding the code block.",
+      "kind": "numeric",
+      "lo": null,
+      "hi": null,
+      "author": "Timia",
+      "version": "v1",
+      "script": "def task_func(task_prompt: str) -> float:\n    import re\n    from nltk.tokenize import sent_tokenize\n    m = re.search(r\"```(?:python)?\\n(.*?)```\", task_prompt, re.DOTALL)\n    t = task_prompt[:m.start()] if m else task_prompt\n    sents = [s for s in sent_tokenize(t.strip()) if s.strip()]\n    if not sents:\n        return 0.0\n    verbos = r\"^(Extract|Generate|Compute|Calculate|Create|Return|Convert|Parse|Read|Write|Check|Validate|Find|Count|Remove|Add|Merge|Split|Filter|Sort|Build|Plot|Load|Save)\\b\"\n    return float(sum(1 for s in sents if re.match(verbos, s.strip())) / len(sents))",
+      "question_key": "q98"
+    },
+    {
+      "text": "Does the statement use precise technical or mathematical terminology to specify what must be computed, rather than colloquial description? Answer Yes or No.",
+      "kind": "binary",
+      "lo": 0,
+      "hi": 1,
+      "author": "Timia",
+      "version": "v1",
+      "question_key": "q109"
     }
   ]
 }

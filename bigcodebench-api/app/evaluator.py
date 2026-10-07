@@ -1,26 +1,27 @@
-"""Wrapper sobre el sandbox de BigCodeBench.
+"""Wrapper over the BigCodeBench sandbox.
 
-`bigcodebench.evaluate` (el CLI oficial) está pensado para correr el benchmark
-completo contra el dataset oficial. Para evaluar una sola (task, solución) a
-demanda usamos directamente las piezas de más bajo nivel que expone el
-paquete:
+`bigcodebench.evaluate` (the official CLI) is designed to run the full
+benchmark against the official dataset. To evaluate a single (task, solution)
+pair on demand, we use the lower-level pieces exposed by the package
+directly:
 
-- `get_bigcodebench()` para resolver un `bcb_task_id` oficial (ej.
-  "BigCodeBench/12") al `test` y `entry_point` reales de esa tarea.
-- `untrusted_check(...)` para ejecutar la solución candidata contra ese test
-  dentro del sandbox (subprocess con límites de recursos) que ya trae la
-  imagen `bigcodebench/bigcodebench-evaluate`.
+- `get_bigcodebench()` to resolve an official `bcb_task_id` (e.g.
+  "BigCodeBench/12") to the real `test` and `entry_point` of that task.
+- `untrusted_check(...)` to run the candidate solution against that test
+  inside the sandbox (subprocess with resource limits) already bundled in
+  the `bigcodebench/bigcodebench-evaluate` image.
 """
 
 import time
 
 from bigcodebench.data import get_bigcodebench
 from bigcodebench.eval import untrusted_check
+from bigcodebench.sanitize import sanitize
 
 from app.schemas import EvaluateResult
 
-# Defaults tomados de los valores documentados para el CLI oficial
-# (ver ADVANCED_USAGE.md de bigcodebench). Pueden overridearse por request.
+# Defaults taken from the values documented for the official CLI
+# (see bigcodebench's ADVANCED_USAGE.md). Can be overridden per request.
 DEFAULT_MAX_AS_LIMIT_MB = 30 * 1024
 DEFAULT_MAX_DATA_LIMIT_MB = 30 * 1024
 DEFAULT_MAX_STACK_LIMIT_MB = 10
@@ -31,15 +32,15 @@ _dataset: dict | None = None
 
 
 def load_dataset() -> dict:
-    """Carga y cachea el dataset oficial (subset "full") en memoria del proceso.
+    """Load and cache the official dataset (the "full" subset) in process memory.
 
-    Se llama una sola vez al levantar el contenedor (ver app/main.py). La
-    primera vez puede descargar el dataset desde Hugging Face; llamadas
-    posteriores a get_bigcodebench() dentro del mismo proceso reusan el cache
-    interno del paquete. No se expone ningún endpoint para listar/descargar
-    este dataset: bigcodebench-api solo lo usa para resolver el `test` real
-    al evaluar; si el usuario quiere el catálogo oficial para subirlo a
-    routerkit-api, lo genera aparte (ver carpeta de datasets del repo).
+    Called once when the container starts up (see app/main.py). The first
+    call may download the dataset from Hugging Face; subsequent calls to
+    get_bigcodebench() within the same process reuse the package's internal
+    cache. No endpoint is exposed to list/download this dataset:
+    bigcodebench-api only uses it to resolve the real `test` when evaluating;
+    if the user wants the official catalog to upload to routerkit-api, they
+    generate it separately (see the repo's datasets folder).
     """
     global _dataset
     if _dataset is None:
@@ -48,9 +49,9 @@ def load_dataset() -> dict:
 
 
 def get_task(bcb_task_id: str) -> dict:
-    """Devuelve el dict oficial de la tarea (con 'test' y 'entry_point').
+    """Return the official task dict (with 'test' and 'entry_point').
 
-    Lanza KeyError si el bcb_task_id no existe en el dataset oficial.
+    Raises KeyError if the bcb_task_id does not exist in the official dataset.
     """
     dataset = _dataset if _dataset is not None else load_dataset()
     return dataset[bcb_task_id]
@@ -65,16 +66,27 @@ def evaluate(
     min_time_limit_s: float | None = None,
     gt_time_limit_s: float | None = None,
 ) -> EvaluateResult:
-    """Corre `untrusted_check` para (bcb_task_id, solution) y devuelve el veredicto.
+    """Run `untrusted_check` for (bcb_task_id, solution) and return the verdict.
 
-    Bloqueante (hace fork de un subprocess) — debe llamarse desde un
-    threadpool, no directamente en el event loop de FastAPI (ver app/jobs.py).
+    `solution` arrives exactly as the candidate LLM produced it (markdown
+    fences, stray prose, unrelated helper code — see
+    routerkit-api/app/services/generation.py, which stores it unprocessed on
+    purpose). `sanitize()` is the same post-processing step the official
+    BigCodeBench CLI applies before evaluating: it extracts the longest
+    syntactically valid block and keeps only the code reachable from
+    `entry_point`, dropping everything else (markdown fences included).
+    Without this, every solution fails with a syntax error on the fence line
+    regardless of whether the underlying code is correct.
+
+    Blocking (forks a subprocess) — must be called from a threadpool, not
+    directly on FastAPI's event loop (see app/jobs.py).
     """
     task = get_task(bcb_task_id)
+    sanitized_solution = sanitize(solution, entrypoint=task["entry_point"])
 
     started = time.perf_counter()
     status, details = untrusted_check(
-        solution,
+        sanitized_solution,
         task["test"],
         task["entry_point"],
         max_as_limit_mb if max_as_limit_mb is not None else DEFAULT_MAX_AS_LIMIT_MB,

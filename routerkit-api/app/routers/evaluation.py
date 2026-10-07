@@ -1,7 +1,7 @@
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from sqlalchemy import insert, text, update
 from sqlalchemy.orm import Session
 
 from app.clients import bigcodebench_client
@@ -11,11 +11,31 @@ from app.db.models import Grade, Model, Solution, Task
 from app.services import jobs, judge
 from app.services.concurrency import run_bounded
 from app.services.jobs import JobConflictError, ProgressFn
+from app.services.jsonl import parse_jsonl
 from app.services.snapshots import row_to_dict, write_snapshot
+from app.services.tasks_catalog import (
+    TaskIdentifier,
+    load_active_tasks_by_identifier,
+    resolve_task,
+    task_ref,
+)
 
 router = APIRouter(tags=["evaluation"])
 
 _KIND = "solutions_validate"
+
+
+def _deactivate_active_grade(db: Session, *, solution_id: int) -> None:
+    """Deactivates the active grade (if any) for this solution.
+
+    Necessary before inserting a new one: there can only be one active row
+    per solution_id (idx_grades_natural_key_active).
+    """
+    db.execute(
+        update(Grade)
+        .where(Grade.solution_id == solution_id, Grade.active.is_(True))
+        .values(active=False)
+    )
 
 
 def _store_grade(
@@ -28,11 +48,9 @@ def _store_grade(
     exec_ms: float | None,
     has_error: bool,
 ) -> None:
-    """Reemplaza el grade de esta solution (a lo sumo 1, es su PK)."""
-    existing = db.get(Grade, solution_id)
-    if existing:
-        db.delete(existing)
-        db.flush()
+    """Replaces this solution's active grade (soft delete + insert, same
+    pattern as solutions/features — see _deactivate_active_grade)."""
+    _deactivate_active_grade(db, solution_id=solution_id)
     db.add(
         Grade(
             solution_id=solution_id,
@@ -45,31 +63,89 @@ def _store_grade(
     )
 
 
-def _find_active_solution(db: Session, *, task_id: int, model_name: str, sample_idx: int) -> Solution | None:
-    model = (
-        db.query(Model)
-        .filter(Model.name == model_name, Model.role == "candidate", Model.active.is_(True))
-        .one_or_none()
+def _load_active_candidates_by_name(db: Session) -> dict[str, Model]:
+    """Bulk alternative to looking up a candidate by name once per row —
+    all active candidates fit comfortably in memory (there's never more
+    than a handful), unlike the rows referencing them."""
+    candidates = db.query(Model).filter(Model.role == "candidate", Model.active.is_(True)).all()
+    return {m.name: m for m in candidates}
+
+
+def _load_active_solution_ids_by_identity(db: Session) -> dict[tuple[int, int, int], int]:
+    """Bulk alternative to `_find_active_solution()`-style queries once per
+    row: a single query for (task_id, model_id, sample_idx, solution_id) of
+    every active solution — selecting only those 4 integer columns, not
+    full Solution rows (which carry a `code` text column that would bloat
+    memory for no reason here) — returned as a lookup dict. At a few
+    hundred thousand rows (a real type=load of the project's experiment
+    data), one query instead of one round trip per row is the difference
+    between seconds and the better part of an hour."""
+    rows = db.query(Solution.task_id, Solution.model_id, Solution.sample_idx, Solution.solution_id).filter(
+        Solution.active.is_(True)
     )
-    if model is None:
-        return None
-    return (
-        db.query(Solution)
-        .filter(
-            Solution.task_id == task_id,
-            Solution.model_id == model.model_id,
-            Solution.sample_idx == sample_idx,
-            Solution.active.is_(True),
-        )
-        .one_or_none()
+    return {(task_id, model_id, sample_idx): solution_id for task_id, model_id, sample_idx, solution_id in rows}
+
+
+def _bulk_deactivate_grades(db: Session, solution_ids: list[int]) -> None:
+    """Deactivates the active grade (if any) for each solution_id, in one
+    statement via `= ANY(...)` (a single array parameter) instead of one
+    UPDATE per row (slow at scale) or a single `.in_(...)` over a flat list
+    of ids (hits Postgres's ~65535 bound-parameter limit once `solution_ids`
+    is in the hundreds of thousands — see _write_grades_snapshot's
+    docstring for the incident this same shape caused). Necessary before
+    inserting new ones: there can only be one active row per solution_id
+    (idx_grades_natural_key_active).
+    """
+    if not solution_ids:
+        return
+    db.execute(
+        text(
+            "UPDATE routerkit.grades SET active = false "
+            "WHERE solution_id = ANY(CAST(:solution_ids AS BIGINT[])) AND active"
+        ),
+        {"solution_ids": solution_ids},
     )
 
 
-class GradeLoadRow(BaseModel):
-    """Un grade ya calculado afuera, para cargar directo (type=load)."""
+def _write_grades_snapshot(db: Session) -> None:
+    """Writes the active-grades snapshot with human-facing identifiers
+    (`bcb_task_id`/`custom_task_id`, `model_name`, `sample_idx`) instead of
+    the raw `solution_id` — this file is meant to be read directly off
+    disk, and that internal id isn't stable/meaningful to a person (see
+    app.services.tasks_catalog).
+
+    A single JOIN, not "fetch active grades, then filter Solution/Task/
+    Model by their ids with .in_(...)": that second shape worked fine at
+    our small test scale, but with hundreds of thousands of active grades
+    (a real type=load of the project's experiment data) the solution_id
+    .in_(...) alone blows past Postgres's ~65535 bound-parameter limit per
+    query and the whole snapshot write fails.
+    """
+    rows = (
+        db.query(Grade, Solution, Task, Model)
+        .join(Solution, Solution.solution_id == Grade.solution_id)
+        .join(Task, Task.task_id == Solution.task_id)
+        .join(Model, Model.model_id == Solution.model_id)
+        .filter(Grade.active.is_(True))
+        .all()
+    )
+
+    def _row(grade: Grade, solution: Solution, task: Task, model: Model) -> dict:
+        extra = {"model_name": model.name, "sample_idx": solution.sample_idx, **task_ref(task)}
+        return row_to_dict(grade, drop={"grade_id", "solution_id"}, extra=extra)
+
+    write_snapshot("grades", [_row(*row) for row in rows])
+
+
+class GradeLoadRow(TaskIdentifier):
+    """A grade already computed externally, to load directly (type=load).
+
+    The task is identified by `bcb_task_id` (benchmark tasks) or
+    `custom_task_id` (custom tasks) — exactly one of the two. Never the
+    internal Postgres `task_id` (see `app.services.tasks_catalog`).
+    """
 
     model_name: str
-    task_id: int
     sample_idx: int = 0
     grader: Literal["tests", "llm_judge"]
     passed: bool | None = None
@@ -78,198 +154,258 @@ class GradeLoadRow(BaseModel):
     has_error: bool = False
 
 
-class ValidateRequest(BaseModel):
-    type: Literal["load", "calculate"] = "calculate"
-    grades: list[GradeLoadRow] | None = Field(
-        default=None, description="Requerido con type=load; ignorado con type=calculate."
-    )
+def _load_grades_job(db: Session, progress: ProgressFn, rows: list[GradeLoadRow]) -> dict:
+    failed = 0
+    errors: list[dict] = []
+    total = len(rows)
+
+    # Bulk-resolve instead of one task/candidate/solution query per row —
+    # at a few hundred thousand rows (a real type=load, not our small test
+    # files), that's the difference between seconds and the better part of
+    # an hour.
+    tasks_by_bcb, tasks_by_custom = load_active_tasks_by_identifier(db)
+    candidates_by_name = _load_active_candidates_by_name(db)
+    solution_ids_by_identity = _load_active_solution_ids_by_identity(db)
+
+    # Keyed by solution_id (grades' natural key) so a later duplicate row
+    # for the same solution in the file simply overwrites the earlier one
+    # in this dict — same "last one wins" result as processing
+    # sequentially, but safe to insert in one batch afterwards (a batch
+    # INSERT can't contain two rows that violate the same partial unique
+    # index).
+    to_insert: dict[int, dict] = {}
+    # Mirrors to_insert key-for-key (None = no error) so a later duplicate
+    # row overwrites this in lockstep too.
+    error_refs: dict[int, dict | None] = {}
+
+    for i, row in enumerate(rows, start=1):
+        task = resolve_task(
+            tasks_by_bcb, tasks_by_custom, bcb_task_id=row.bcb_task_id, custom_task_id=row.custom_task_id
+        )
+        model = candidates_by_name.get(row.model_name)
+        solution_id = (
+            solution_ids_by_identity.get((task.task_id, model.model_id, row.sample_idx))
+            if task is not None and model is not None
+            else None
+        )
+        if solution_id is None:
+            failed += 1
+            errors.append(
+                {
+                    "model_name": row.model_name,
+                    "bcb_task_id": row.bcb_task_id,
+                    "custom_task_id": row.custom_task_id,
+                    "sample_idx": row.sample_idx,
+                    "error": (
+                        "no active task with that bcb_task_id/custom_task_id"
+                        if task is None
+                        else "no active solution for that (model_name, task_id, sample_idx)"
+                    ),
+                }
+            )
+            continue
+
+        to_insert[solution_id] = {
+            "solution_id": solution_id,
+            "grader": row.grader,
+            "passed": row.passed,
+            "fail_reason": row.fail_reason,
+            "exec_ms": row.exec_ms,
+            "has_error": row.has_error,
+        }
+        error_refs[solution_id] = (
+            {"model_name": row.model_name, **task_ref(task), "sample_idx": row.sample_idx, "error": row.fail_reason}
+            if row.has_error
+            else None
+        )
+        if i % jobs.PROGRESS_BATCH_SIZE == 0 or i == total:
+            progress(i, total, f"resolved {i}/{total}")
+
+    _bulk_deactivate_grades(db, list(to_insert.keys()))
+    db.commit()
+    if to_insert:
+        db.execute(insert(Grade), list(to_insert.values()))
+        db.commit()
+
+    for ref in error_refs.values():
+        if ref is not None:
+            failed += 1
+            errors.append(ref)
+
+    progress(total, total, f"{total}/{total} processed")
+
+    _write_grades_snapshot(db)
+
+    return {"graded": len(to_insert), "failed": failed, "errors": errors}
 
 
-def _validate_solutions_job(db: Session, progress: ProgressFn, body: ValidateRequest) -> dict:
-    """Cuerpo real de /solutions/validate — corre en background (ver app.services.jobs)."""
+def _calculate_grades_job(db: Session, progress: ProgressFn) -> dict:
     graded = 0
     failed = 0
     errors: list[dict] = []
 
-    if body.type == "load":
-        rows = body.grades or []
-        total = len(rows)
+    # Full replace, not targeted: this run's freshly computed grades are
+    # meant to be the ONLY active ones afterwards (same reasoning as
+    # solutions.py's _calculate_solutions_job) — deactivate everything
+    # upfront instead of only the solution_ids this run happens to touch.
+    db.execute(update(Grade).where(Grade.active.is_(True)).values(active=False))
 
-        for i, row in enumerate(rows, start=1):
-            solution = _find_active_solution(
-                db, task_id=row.task_id, model_name=row.model_name, sample_idx=row.sample_idx
-            )
-            if solution is None:
-                failed += 1
-                errors.append(
-                    {
-                        "model_name": row.model_name,
-                        "task_id": row.task_id,
-                        "sample_idx": row.sample_idx,
-                        "error": "no hay ninguna solution activa para esa (model_name, task_id, sample_idx)",
-                    }
-                )
-                progress(i, total, f"{i}/{total} procesadas")
-                continue
+    solutions = db.query(Solution).filter(Solution.active.is_(True), Solution.code.isnot(None)).all()
+    task_ids = {s.task_id for s in solutions}
+    model_ids = {s.model_id for s in solutions}
+    tasks_by_id = {t.task_id: t for t in db.query(Task).filter(Task.task_id.in_(task_ids)).all()}
+    models_by_id = {m.model_id: m for m in db.query(Model).filter(Model.model_id.in_(model_ids)).all()}
 
+    def _solution_ref(solution: Solution) -> dict:
+        model = models_by_id.get(solution.model_id)
+        task = tasks_by_id.get(solution.task_id)
+        ref = {"model_name": model.name if model else None, "sample_idx": solution.sample_idx}
+        if task is not None:
+            ref.update(task_ref(task))
+        return ref
+
+    benchmark: list[tuple[Task, Solution]] = []
+    custom: list[tuple[Task, Solution]] = []
+    for solution in solutions:
+        task = tasks_by_id.get(solution.task_id)
+        if task is None:
+            continue
+        (benchmark if task.bcb_task_id else custom).append((task, solution))
+
+    total = len(benchmark) + len(custom)
+    processed = 0
+
+    # Benchmark: sequential (it's already a background async job, no need
+    # to parallelize against bigcodebench-api — see conversation).
+    for task, solution in benchmark:
+        try:
+            result = bigcodebench_client.evaluate(task.bcb_task_id, solution.code)
+        except BigCodeBenchError as exc:
             _store_grade(
                 db,
                 solution.solution_id,
-                grader=row.grader,
-                passed=row.passed,
-                fail_reason=row.fail_reason,
-                exec_ms=row.exec_ms,
-                has_error=row.has_error,
+                grader="tests",
+                passed=None,
+                fail_reason=str(exc),
+                exec_ms=None,
+                has_error=True,
             )
-            graded += 1
-            if row.has_error:
-                failed += 1
-                errors.append(
-                    {
-                        "model_name": row.model_name,
-                        "task_id": row.task_id,
-                        "sample_idx": row.sample_idx,
-                        "error": row.fail_reason,
-                    }
-                )
-            progress(i, total, f"{i}/{total} procesadas")
+            failed += 1
+            errors.append({**_solution_ref(solution), "error": str(exc)})
+        else:
+            _store_grade(
+                db,
+                solution.solution_id,
+                grader="tests",
+                passed=result["passed"],
+                fail_reason=result["fail_reason"],
+                exec_ms=result["exec_ms"],
+                has_error=False,
+            )
+        graded += 1
+        processed += 1
+        progress(processed, total, f"{processed}/{total} processed (benchmark)")
+
+    # Custom: concurrent, up to judge_model.concurrency calls in flight.
+    judge_model = db.query(Model).filter(Model.role == "judge", Model.active.is_(True)).one_or_none()
+    if judge_model is None:
+        for task, solution in custom:
+            failed += 1
+            errors.append({**_solution_ref(solution), "error": "no active model with role='judge'"})
+            processed += 1
+            progress(processed, total, f"{processed}/{total} processed (custom)")
     else:
-        solutions = (
-            db.query(Solution).filter(Solution.active.is_(True), Solution.code.isnot(None)).all()
+        judge_results = run_bounded(
+            custom,
+            lambda pair: judge.grade_with_llm_judge(pair[0], pair[1], judge_model),
+            judge_model.concurrency,
         )
-        task_ids = {s.task_id for s in solutions}
-        tasks_by_id = {t.task_id: t for t in db.query(Task).filter(Task.task_id.in_(task_ids)).all()}
-
-        benchmark: list[tuple[Task, Solution]] = []
-        custom: list[tuple[Task, Solution]] = []
-        for solution in solutions:
-            task = tasks_by_id.get(solution.task_id)
-            if task is None:
-                continue
-            (benchmark if task.bcb_task_id else custom).append((task, solution))
-
-        total = len(benchmark) + len(custom)
-        processed = 0
-
-        # Benchmark: secuencial (ya es un job async de fondo, no hace falta
-        # paralelizar contra bigcodebench-api — ver conversación).
-        for task, solution in benchmark:
-            try:
-                result = bigcodebench_client.evaluate(task.bcb_task_id, solution.code)
-            except BigCodeBenchError as exc:
+        for (task, solution), result, exc in judge_results:
+            if exc is not None:
                 _store_grade(
                     db,
                     solution.solution_id,
-                    grader="tests",
+                    grader="llm_judge",
                     passed=None,
                     fail_reason=str(exc),
                     exec_ms=None,
                     has_error=True,
                 )
                 failed += 1
-                errors.append({"solution_id": solution.solution_id, "error": str(exc)})
+                errors.append({**_solution_ref(solution), "error": str(exc)})
             else:
                 _store_grade(
                     db,
                     solution.solution_id,
-                    grader="tests",
-                    passed=result["passed"],
-                    fail_reason=result["fail_reason"],
-                    exec_ms=result["exec_ms"],
+                    grader="llm_judge",
+                    passed=result.passed,
+                    fail_reason=result.fail_reason,
+                    exec_ms=result.exec_ms,
                     has_error=False,
                 )
             graded += 1
             processed += 1
-            progress(processed, total, f"{processed}/{total} procesadas (benchmark)")
+            progress(processed, total, f"{processed}/{total} processed (custom)")
 
-        # Custom: concurrente, hasta judge_model.concurrency llamadas en vuelo.
-        judge_model = db.query(Model).filter(Model.role == "judge", Model.active.is_(True)).one_or_none()
-        if judge_model is None:
-            for task, solution in custom:
-                failed += 1
-                errors.append(
-                    {
-                        "solution_id": solution.solution_id,
-                        "error": "no hay ningún model con role='judge' activo",
-                    }
-                )
-                processed += 1
-                progress(processed, total, f"{processed}/{total} procesadas (custom)")
-        else:
-            judge_results = run_bounded(
-                custom,
-                lambda pair: judge.grade_with_llm_judge(pair[0], pair[1], judge_model),
-                judge_model.concurrency,
-            )
-            for (task, solution), result, exc in judge_results:
-                if exc is not None:
-                    _store_grade(
-                        db,
-                        solution.solution_id,
-                        grader="llm_judge",
-                        passed=None,
-                        fail_reason=str(exc),
-                        exec_ms=None,
-                        has_error=True,
-                    )
-                    failed += 1
-                    errors.append({"solution_id": solution.solution_id, "error": str(exc)})
-                else:
-                    _store_grade(
-                        db,
-                        solution.solution_id,
-                        grader="llm_judge",
-                        passed=result.passed,
-                        fail_reason=result.fail_reason,
-                        exec_ms=result.exec_ms,
-                        has_error=False,
-                    )
-                graded += 1
-                processed += 1
-                progress(processed, total, f"{processed}/{total} procesadas (custom)")
-
-    active_grades = db.query(Grade).filter(Grade.active.is_(True)).all()
-    write_snapshot("grades", [row_to_dict(g) for g in active_grades])
+    _write_grades_snapshot(db)
 
     return {"graded": graded, "failed": failed, "errors": errors}
 
 
 @router.post("/solutions/validate", status_code=202)
-def validate_solutions(body: ValidateRequest, db: Session = Depends(get_db)) -> dict:
-    """Lanza (async) la carga (`type=load`) o cálculo (`type=calculate`) de
-    grades para las solutions activas. Devuelve enseguida el estado inicial
-    — para ver el progreso o el resultado final, consultar `GET /jobs`
-    (estado de TODOS los kinds en un solo request, incluido este). 409 si
-    ya hay un job de `kind='solutions_validate'` corriendo.
+async def validate_solutions(
+    type: Literal["load", "calculate"] = "calculate",  # noqa: A002 - domain name
+    file: UploadFile | None = File(
+        default=None,
+        description="JSONL (one GradeLoadRow per line). Required with type=load.",
+    ),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Launches (async) the load (`type=load`) or calculation
+    (`type=calculate`) of grades for the active solutions. Returns the
+    initial state right away — to see progress or the final result, check
+    `GET /jobs` (state of ALL kinds in a single request, including this
+    one). 409 if a `kind='solutions_validate'` job is already running.
 
-    - `type=calculate` (default, sin parámetros adicionales): toma TODAS
-      las solutions activas con código generado, las agrupa por
-      `task.bcb_task_id` (benchmark) vs custom, y las evalúa:
-      - benchmark -> bigcodebench-api, **secuencial** (ya es un job async
-        de fondo, no bloquea a nadie, así que no vale la pena paralelizar
-        contra un servicio que además ya tiene su propio límite interno).
-      - custom -> el único model con `role='judge'` activo, con hasta
-        `judge_model.concurrency` llamadas en vuelo a la vez (ver
+    - `type=calculate` (default, no `file`): FULL replace — deactivates ALL
+      existing active grades first, then takes ALL active solutions with
+      generated code, groups them by `task.bcb_task_id` (benchmark) vs
+      custom, and evaluates them:
+      - benchmark -> bigcodebench-api, **sequential** (it's already a
+        background async job, it doesn't block anyone, so it's not worth
+        parallelizing against a service that also already has its own
+        internal limit).
+      - custom -> the single active model with `role='judge'`, with up to
+        `judge_model.concurrency` calls in flight at a time (see
         services.concurrency.run_bounded).
-      Un fallo de infraestructura (bigcodebench-api caído, timeout, falla
-      del juez) se guarda con `has_error=true` en el grade — DISTINTO de
-      que el evaluador haya determinado `passed=false` — y no aborta el
-      resto del lote.
-    - `type=load`: inserta directo los grades de `grades`, sin llamar a
-      bigcodebench-api ni al juez; cada fila identifica su solution por
-      `(model_name, task_id, sample_idx)`.
+      An infrastructure failure (bigcodebench-api down, timeout, judge
+      failure) is saved with `has_error=true` in the grade — DIFFERENT from
+      the evaluator having determined `passed=false` — and does not abort
+      the rest of the batch. Only the grades computed by THIS run end up
+      active — running it again regrades everything from scratch, it's
+      never incremental.
+    - `type=load`: TARGETED replace — requires `file` (multipart), a
+      `.jsonl` with one `GradeLoadRow` per line — without calling
+      bigcodebench-api or the judge; each line identifies its solution by
+      `model_name` + `sample_idx` + its task (`bcb_task_id` for benchmark,
+      or `custom_task_id` for custom). `grades` has PK=solution_id (1:1
+      with the solution), so loading a row simply replaces that solution's
+      previous grade, leaving the rest of the active catalog untouched.
 
-    Reemplazo en el lugar: `grades` tiene PK=solution_id (1:1 con la
-    solution), así que reevaluar una solution simplemente reemplaza su
-    grade anterior. Al terminar deja un snapshot de los grades activos
-    resultantes en data/current/grades.json (rotando el anterior a
-    data/previous).
+    When finished it leaves a snapshot of the resulting active grades in
+    data/current/grades.json (rotating the previous one to data/previous).
     """
-    if body.type == "load" and not body.grades:
-        raise HTTPException(status_code=422, detail="type=load requiere 'grades'")
+    if type == "load":
+        if file is None:
+            raise HTTPException(status_code=422, detail="type=load requires 'file'")
+        raw = (await file.read()).decode("utf-8")
+        rows = parse_jsonl(raw, GradeLoadRow)
+        target = lambda db, progress: _load_grades_job(db, progress, rows)  # noqa: E731
+    else:
+        target = _calculate_grades_job
 
     try:
-        job = jobs.start_job(_KIND, lambda db, progress: _validate_solutions_job(db, progress, body), db)
+        job = jobs.start_job(_KIND, target, db)
     except JobConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 

@@ -1,21 +1,21 @@
-"""Agregación real de targets y model_metrics a partir de solutions/grades activas.
+"""Real aggregation of targets and model_metrics from active solutions/grades.
 
-Fórmulas basadas en los comentarios del schema (routerkit.targets,
+Formulas based on the schema comments (routerkit.targets,
 routerkit.model_metrics):
 
-- targets: n = soluciones generadas, k = soluciones con grades.passed=True,
-  pass_rate = k/n. Una fila por (task, model candidato).
-- model_metrics, por model:
-  - taskpass_pct: % de tasks con al menos una solución correcta (k>0 en targets).
-  - complete_pct: % de solutions cuya generación no falló (gen_error IS NULL).
-  - pass_rate_avg: promedio de targets.pass_rate.
-  - cost_total / cost_per_task: suma de solutions.cost_usd, dividido entre
-    tasks distintas.
-  - latency_avg_ms / tokens_out_avg: promedio de solutions.latency_ms / tokens_out.
+- targets: n = generated solutions, k = solutions with grades.passed=True,
+  pass_rate = k/n. One row per (task, candidate model).
+- model_metrics, per model:
+  - taskpass_pct: % of tasks with at least one correct solution (k>0 in targets).
+  - complete_pct: % of solutions whose generation did not fail (gen_error IS NULL).
+  - pass_rate_avg: average of targets.pass_rate.
+  - cost_total / cost_per_task: sum of solutions.cost_usd, divided by
+    the distinct number of tasks.
+  - latency_avg_ms / tokens_out_avg: average of solutions.latency_ms / tokens_out.
 
-Reemplazo completo con borrado lógico: desactiva todos los targets /
-model_metrics existentes y crea filas nuevas activas, a partir de las
-solutions/grades activas en este momento.
+Full replacement via soft delete: deactivates all existing targets /
+model_metrics and creates new active rows, from the solutions/grades that
+are active at this moment.
 """
 
 from sqlalchemy import func, select, update

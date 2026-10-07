@@ -1,0 +1,2 @@
+{"model_name": "gpt-4o-mini", "custom_task_id": "add-two-integers", "sample_idx": 0, "grader": "llm_judge", "passed": true, "exec_ms": 120.3}
+{"model_name": "gpt-4o", "bcb_task_id": "BigCodeBench/0", "sample_idx": 0, "grader": "tests", "passed": false, "fail_reason": "The solution does not handle the empty list case."}

@@ -31,30 +31,33 @@ OPENAPI_TAGS = [
     {
         "name": "catalogs",
         "description": (
-            "Import de catálogos: tareas (arrancan pre-cargadas con el benchmark "
-            "oficial de BigCodeBench, reemplazables por las propias del usuario, "
-            "custom/benchmark/mezcladas), preguntas de features y modelos."
+            "Catalog import: tasks (start pre-loaded with the official "
+            "BigCodeBench benchmark, replaceable with the user's own, "
+            "custom/benchmark/mixed), feature questions, and models."
         ),
     },
     {
         "name": "solutions",
-        "description": "Generación (async) de soluciones vía LLM candidato, o carga directa (type=load).",
+        "description": "(Async) generation of solutions via a candidate LLM, or direct load (type=load).",
     },
     {
         "name": "evaluation",
         "description": (
-            "Valida (async) las solutions activas: bigcodebench-api si la tarea es de "
-            "benchmark, juez LLM si es custom."
+            "(Async) validates the active solutions: bigcodebench-api if the task is a "
+            "benchmark one, LLM judge if it's custom."
         ),
     },
-    {"name": "aggregation", "description": "Recalcula targets y model_metrics a partir de solutions/grades activos."},
-    {"name": "features", "description": "Cálculo (async) de features LLM/programáticas sobre tasks/questions activas."},
-    {"name": "training", "description": "Entrenamiento del predictor (AutoML, stub) con features/targets activos."},
-    {"name": "routing", "description": "Ruteo en producción con el predictor productivo (stub)."},
+    {"name": "aggregation", "description": "Recomputes targets and model_metrics from the active solutions/grades."},
+    {"name": "features", "description": "(Async) computation of LLM/programmatic features over active tasks/questions."},
+    {
+        "name": "training",
+        "description": "Training of the predictor (fixed GradientBoostingRegressor) with active features/targets.",
+    },
+    {"name": "routing", "description": "Routes a task to the best candidate LLM using the active predictor."},
     {
         "name": "jobs",
         "description": (
-            "Estado de los procesos async de larga duración (features/compute, "
+            "Status of long-running async processes (features/compute, "
             "solutions/generate, solutions/validate)."
         ),
     },
@@ -63,9 +66,9 @@ OPENAPI_TAGS = [
 app = FastAPI(
     title="routerkit-api",
     description=(
-        "Orquestador de RouterKit: catálogos, features, generación de soluciones, "
-        "evaluación (bigcodebench-api o juez LLM), agregación y entrenamiento del "
-        "router de LLMs. Sin conceptos de 'experimento': todo opera sobre lo activo."
+        "RouterKit orchestrator: catalogs, features, solution generation, "
+        "evaluation (bigcodebench-api or LLM judge), aggregation, and training of the "
+        "LLM router. No 'experiment' concept: everything operates on what's active."
     ),
     version="0.1.0",
     openapi_tags=OPENAPI_TAGS,

@@ -1,7 +1,7 @@
-"""Cliente HTTP hacia bigcodebench-api: crea un job y hace polling hasta que termine.
+"""HTTP client for bigcodebench-api: creates a job and polls until it finishes.
 
-bigcodebench-api solo evalúa tareas oficiales del benchmark (bcb_task_id +
-solution); ver app/services/judge.py para tareas custom.
+bigcodebench-api only evaluates official benchmark tasks (bcb_task_id +
+solution); see app/services/judge.py for custom tasks.
 """
 
 import time
@@ -26,9 +26,9 @@ def evaluate(
     poll_interval_s: float = 1.0,
     timeout_s: float = 120.0,
 ) -> dict[str, Any]:
-    """Crea el job de evaluación y espera el resultado (bloqueante).
+    """Creates the evaluation job and waits for the result (blocking).
 
-    Devuelve el dict `result` del job (passed/status/fail_reason/exec_ms/details).
+    Returns the job's `result` dict (passed/status/fail_reason/exec_ms/details).
     """
     with httpx.Client(base_url=settings.bigcodebench_api_url, timeout=30.0) as client:
         response = client.post(
@@ -50,4 +50,4 @@ def evaluate(
 
             time.sleep(poll_interval_s)
 
-    raise BigCodeBenchTimeout(f"job {job_id} no terminó dentro de {timeout_s}s")
+    raise BigCodeBenchTimeout(f"job {job_id} did not finish within {timeout_s}s")

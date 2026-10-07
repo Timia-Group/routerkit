@@ -1,21 +1,22 @@
-"""Jobs async de larga duración, persistidos en Postgres (routerkit.jobs).
+"""Long-running async jobs, persisted in Postgres (routerkit.jobs).
 
-Mismo patrón de borrado lógico que el resto del sistema: a lo sumo una fila
-ACTIVA por `kind` (idx_jobs_unique_active_kind), que se actualiza in-place
-(status/message/progress) mientras corre. `start_job(kind, ...)` desactiva
-la fila anterior de ese kind y crea una nueva — pero solo si la anterior ya
-terminó (done/error); si sigue pending/running, lanza JobConflictError en
-vez de pisar un proceso en curso. `reset_all_on_startup(db)` se llama una
-vez al arrancar el container (ver lifespan en app/main.py): desactiva
-cualquier fila que haya quedado 'running' de una instancia anterior
-(crash, redeploy) y crea una fila fresca en status='empty' para cada kind
-conocido.
+Same soft-delete pattern as the rest of the system: at most one ACTIVE row
+per `kind` (idx_jobs_unique_active_kind), updated in-place
+(status/message/progress) while it runs. `start_job(kind, ...)` deactivates
+the previous row of that kind and creates a new one — but only if the
+previous one already finished (done/error); if it's still pending/running,
+it raises JobConflictError instead of overwriting a job in progress.
+`reset_all_on_startup(db)` is called once when the container starts (see
+lifespan in app/main.py): it deactivates any row left 'running' from a
+previous instance (crash, redeploy) and creates a fresh row in
+status='empty' for each known kind.
 
-`start_job` lanza `target` en un hilo de background con SU PROPIA sesión de
-SQLAlchemy — para cuando `target` corre de verdad, el request que lo
-disparó ya devolvió la respuesta y esa sesión está cerrada. `target(db,
-progress)` recibe esa sesión nueva más una función `progress` para
-reportar avance; lo que `target` devuelve queda en `job.result`.
+`start_job` launches `target` in a background thread with ITS OWN
+SQLAlchemy session — because by the time `target` actually runs, the
+request that triggered it has already returned its response and that
+session is closed. `target(db, progress)` receives that new session plus a
+`progress` function to report progress; whatever `target` returns ends up
+in `job.result`.
 """
 
 import traceback
@@ -30,11 +31,19 @@ from sqlalchemy.orm import Session
 from app.db.base import SessionLocal
 from app.db.models import Job
 
-# Kinds conocidos, para que GET /jobs siempre los muestre a todos aunque
-# alguno nunca se haya corrido, y para que el reset de arranque sepa a
-# cuáles crearles la fila 'empty'. Agregar acá cuando se sume un nuevo tipo
-# de proceso async (ej. "evaluation" cuando se implemente validación).
-KNOWN_KINDS = ["features_compute", "solutions_generate", "solutions_validate"]
+# Known kinds, so that GET /jobs always shows all of them even if one has
+# never run, and so the startup reset knows which ones to create an
+# 'empty' row for. Add here when a new kind of async process is added
+# (e.g. "evaluation" once validation is implemented).
+KNOWN_KINDS = ["features_compute", "solutions_generate", "solutions_validate", "train_predictor"]
+
+# How often (in rows) a type=load loop calls progress() — which commits —
+# instead of every single row. At hundreds of thousands of rows (a
+# type=load of the real experiment's data, not our small test files),
+# committing every row makes the whole job take forever for no benefit;
+# every PROGRESS_BATCH_SIZE rows keeps that overhead negligible while still
+# limiting how much uncommitted work a crash partway through could lose.
+PROGRESS_BATCH_SIZE = 200
 
 ProgressFn = Callable[[int, int, str | None], None]
 
@@ -42,7 +51,7 @@ _executor = ThreadPoolExecutor(max_workers=8)
 
 
 class JobConflictError(RuntimeError):
-    """Ya hay un job pending/running de este mismo kind."""
+    """There's already a pending/running job of this same kind."""
 
 
 def _run(job_id: int, target: Callable[[Session, ProgressFn], dict[str, Any]]) -> None:
@@ -61,7 +70,7 @@ def _run(job_id: int, target: Callable[[Session, ProgressFn], dict[str, Any]]) -
 
         try:
             result = target(db, progress)
-        except Exception as exc:  # noqa: BLE001 - se guarda el error, no se pierde
+        except Exception as exc:  # noqa: BLE001 - the error is saved, not lost
             db.rollback()
             row = db.get(Job, job_id)
             row.status = "error"
@@ -82,16 +91,16 @@ def _run(job_id: int, target: Callable[[Session, ProgressFn], dict[str, Any]]) -
 def start_job(
     kind: str, target: Callable[[Session, ProgressFn], dict[str, Any]], db: Session
 ) -> Job:
-    """Desactiva la fila activa anterior de `kind` (si ya terminó) y crea una
-    nueva, lanzando `target` en background. JobConflictError si la anterior
-    sigue pending/running."""
+    """Deactivates the previous active row of `kind` (if it already finished)
+    and creates a new one, launching `target` in the background.
+    JobConflictError if the previous one is still pending/running."""
     existing = db.execute(
         select(Job).where(Job.kind == kind, Job.active.is_(True))
     ).scalar_one_or_none()
 
     if existing is not None:
         if existing.status in ("pending", "running"):
-            raise JobConflictError(f"ya hay un job '{kind}' en curso (job_id={existing.job_id})")
+            raise JobConflictError(f"a '{kind}' job is already in progress (job_id={existing.job_id})")
         existing.active = False
 
     job = Job(kind=kind, status="pending", active=True)
@@ -104,14 +113,14 @@ def start_job(
 
 
 def to_board_entry(job: Job | None, kind: str) -> dict[str, Any]:
-    """Arma la entrada de estado (misma forma que status_board) para una fila
-    puntual — la usan tanto status_board como la respuesta de los POST que
-    arrancan un job, para no duplicar el formato."""
+    """Builds the status entry (same shape as status_board) for a single
+    row — used by both status_board and the response of the POST endpoints
+    that start a job, to avoid duplicating the format."""
     if job is None or job.status == "empty":
         return {
             "kind": kind,
             "status": "empty",
-            "message": "sin ejecuciones previas",
+            "message": "no previous runs",
             "started_at": job.started_at if job else None,
             "finished_at": None,
             "last_result": None,
@@ -119,13 +128,13 @@ def to_board_entry(job: Job | None, kind: str) -> dict[str, Any]:
 
     if job.status in ("pending", "running"):
         display_status = "running"
-        message = job.message or "iniciando"
+        message = job.message or "starting"
     elif job.status == "error":
         display_status = "idle"
-        message = f"último intento falló: {job.error}"
+        message = f"last attempt failed: {job.error}"
     else:
         display_status = "idle"
-        message = job.message or "completado"
+        message = job.message or "completed"
 
     return {
         "kind": kind,
@@ -138,7 +147,7 @@ def to_board_entry(job: Job | None, kind: str) -> dict[str, Any]:
 
 
 def status_board(db: Session) -> list[dict[str, Any]]:
-    """La fila ACTIVA de cada kind conocido — todos presentes, aunque nunca hayan corrido."""
+    """The ACTIVE row of each known kind — all present, even if they've never run."""
     board = []
     for kind in KNOWN_KINDS:
         job = db.execute(
@@ -149,13 +158,13 @@ def status_board(db: Session) -> list[dict[str, Any]]:
 
 
 def reset_all_on_startup(db: Session) -> None:
-    """Se llama una vez al arrancar el container (lifespan de app/main.py).
+    """Called once when the container starts (lifespan of app/main.py).
 
-    Cualquier fila que haya quedado 'running'/'pending' de una instancia
-    anterior (crash, redeploy) se desactiva — nunca hay una instancia
-    previa realmente viva compitiendo por el mismo Postgres, así que es
-    seguro asumir que ese trabajo se perdió. Cada kind conocido arranca con
-    una fila nueva en status='empty'.
+    Any row left 'running'/'pending' from a previous instance (crash,
+    redeploy) is deactivated — there's never a previous instance that's
+    actually still alive competing for the same Postgres, so it's safe to
+    assume that work was lost. Each known kind starts with a fresh row in
+    status='empty'.
     """
     db.execute(update(Job).where(Job.kind.in_(KNOWN_KINDS), Job.active.is_(True)).values(active=False))
     for kind in KNOWN_KINDS:

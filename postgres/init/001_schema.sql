@@ -4,14 +4,14 @@ BEGIN;
 -- ROUTERKIT
 -- PostgreSQL schema
 --
--- No hay tabla "experiments": el sistema no corre configuraciones
--- paralelas. Cada carga (tasks/questions/models) reemplaza con borrado
--- lógico lo anterior (active=false) y activa solo lo nuevo, en cascada
--- "hacia adelante" (ver app/services/cascade.py) hacia todo lo que se
--- hubiera calculado a partir de esas filas. Todo proceso siempre trabaja
--- sobre "lo activo" — nunca hace falta pasar un id para saber qué usar,
--- salvo para referenciar puntualmente un registro ya generado (ej. para
--- guardarlo como FK del siguiente paso).
+-- There is no "experiments" table: the system does not run parallel
+-- configurations. Each load (tasks/questions/models) replaces the previous
+-- data with a logical delete (active=false) and activates only the new
+-- data, cascading "forward" (see app/services/cascade.py) to everything
+-- that would have been computed from those rows. Every process always
+-- works on "what's active" — there is never a need to pass an id to know
+-- what to use, except to specifically reference an already-generated
+-- record (e.g. to save it as an FK for the next step).
 -- ============================================================
 
 CREATE SCHEMA IF NOT EXISTS routerkit;
@@ -19,7 +19,7 @@ CREATE SCHEMA IF NOT EXISTS routerkit;
 
 -- ============================================================
 -- 1. TASKS
--- Catálogo de tareas de programación
+-- Catalog of programming tasks
 -- ============================================================
 
 CREATE TABLE routerkit.tasks (
@@ -31,22 +31,31 @@ CREATE TABLE routerkit.tasks (
     tags            TEXT[],
     created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
-    -- NULL = tarea custom, se evalúa con juez LLM (services/judge.py).
-    -- Con valor (ej. "BigCodeBench/12") = tarea oficial del benchmark, se
-    -- evalúa 100% dentro de bigcodebench-api contra el dataset oficial.
+    -- NULL = custom task, evaluated with an LLM judge (services/judge.py).
+    -- With a value (e.g. "BigCodeBench/12") = official benchmark task,
+    -- evaluated entirely inside bigcodebench-api against the official dataset.
     bcb_task_id     VARCHAR(255),
 
-    -- Borrado lógico. Al arrancar, routerkit-api precarga acá el catálogo
-    -- oficial de BigCodeBench si la tabla está vacía (ver
-    -- app/services/seed.py). Cada `POST /tasks/import` (el usuario siempre
-    -- sube el jsonl, ninguna API lo descarga sola) desactiva TODAS las
-    -- tasks existentes (sin importar bcb_task_id) y crea filas nuevas
-    -- (nunca actualiza en el lugar) — el archivo puede traer benchmark,
-    -- custom, o ambas mezcladas, cada fila decide por su propio
-    -- bcb_task_id. Así cada fila queda como una foto histórica de cómo era
-    -- la tarea cuando algo la usó, y no se rompen las FK de
-    -- features/solutions/targets que ya apuntan a un task_id de una carga
-    -- anterior. Todo proceso que busque tareas para trabajar debe filtrar
+    -- Stable key the user assigns to a custom task (analogous to
+    -- bcb_task_id, but for tasks that don't come from the benchmark) — so
+    -- that features/solutions/validations can reference it without
+    -- depending on Postgres's internal task_id (which changes depending on
+    -- insertion order, see app/services/tasks_catalog.py). NULL if the task
+    -- is from the benchmark (bcb_task_id is used there) or if this custom
+    -- task doesn't need anything to reference it later.
+    custom_task_id  VARCHAR(255),
+
+    -- Logical delete. On startup, routerkit-api preloads the official
+    -- BigCodeBench catalog here if the table is empty (see
+    -- app/services/seed.py). Each `POST /tasks/import` (the user always
+    -- uploads the jsonl, no API downloads it on its own) deactivates ALL
+    -- existing tasks (regardless of bcb_task_id) and creates new rows
+    -- (never updates in place) — the file can carry benchmark, custom, or
+    -- both mixed, each row decides by its own bcb_task_id. This way each
+    -- row remains a historical snapshot of what the task looked like when
+    -- something used it, and the FKs of features/solutions/targets that
+    -- already point to a task_id from a previous load are not broken.
+    -- Every process that looks for tasks to work on must filter on
     -- active = true.
     active          BOOLEAN NOT NULL DEFAULT TRUE
 );
@@ -54,7 +63,7 @@ CREATE TABLE routerkit.tasks (
 
 -- ============================================================
 -- 2. QUESTIONS
--- Catálogo de preguntas utilizadas para obtener features
+-- Catalog of questions used to obtain features
 -- ============================================================
 
 CREATE TABLE routerkit.questions (
@@ -65,30 +74,44 @@ CREATE TABLE routerkit.questions (
     -- binary | numeric
     kind            VARCHAR(20) NOT NULL,
 
-    -- rango esperado de respuesta
+    -- expected response range
     lo              NUMERIC,
     hi              NUMERIC,
 
     author          VARCHAR(255),
     version         VARCHAR(100),
 
-    -- Borrado lógico: cada POST /questions/import reemplaza TODO el
-    -- catálogo (desactiva todas las existentes, activa solo las nuevas).
+    -- Stable key the user assigns to the question (e.g. "p41"), so that
+    -- features/solutions/validations (type=load) reference it without
+    -- depending on Postgres's internal question_id (which changes on
+    -- every reload of questions.json, see app/services/tasks_catalog.py
+    -- for the same pattern applied to tasks).
+    question_key    VARCHAR(255),
+
+    -- Logical delete: each POST /questions/import replaces the ENTIRE
+    -- catalog (deactivates all existing ones, activates only the new ones).
     active          BOOLEAN NOT NULL DEFAULT TRUE,
 
-    -- NULL = la pregunta se resuelve con el LLM (el model con role='feature'
-    -- activo). Con valor = texto de una función Python completa con firma
-    -- fija `def task_func(task_prompt: str) -> float` (mismo nombre de
-    -- función que usa BigCodeBench como entry_point); se ejecuta con el
-    -- prompt de la tarea como único input y no pasa por ningún LLM (costo
-    -- cero).
-    script          TEXT
+    -- NULL = the question is resolved with the LLM (the active model with
+    -- role='feature'). With a value = text of a complete Python function
+    -- with fixed signature `def task_func(task_prompt: str) -> float`
+    -- (same function name BigCodeBench uses as entry_point); it runs with
+    -- the task prompt as its only input and does not go through any LLM
+    -- (zero cost).
+    script          TEXT,
+
+    -- How many times to repeat this question's LLM call and average
+    -- (simple mean) the resulting value — guards against the LLM's answer
+    -- varying between calls, at the cost of repetitions x the
+    -- tokens/price. Ignored for a script question (deterministic, always
+    -- computed once regardless of this value — see features_python.py).
+    repetitions     INTEGER NOT NULL DEFAULT 1
 );
 
 
 -- ============================================================
 -- 3. MODELS
--- Catálogo de modelos: candidatos a rutear, o jueces (features/grading)
+-- Catalog of models: routing candidates, or judges (features/grading)
 -- ============================================================
 
 CREATE TABLE routerkit.models (
@@ -103,42 +126,52 @@ CREATE TABLE routerkit.models (
     endpoint            TEXT,
     deployment          VARCHAR(255),
 
-    -- nombre de la variable de entorno a usar para este modelo (permite
-    -- tener varias keys del mismo provider y elegir cuál usa cada modelo).
-    -- NULL = se resuelve por la convención fija de provider (ver
-    -- app/clients/llm_client.py y .env.example).
+    -- name of the environment variable to use for this model (allows
+    -- having several keys for the same provider and choosing which one
+    -- each model uses). NULL = resolved by the fixed provider convention
+    -- (see app/clients/llm_client.py and .env.example).
     api_key_env         VARCHAR(255),
 
-    -- precios USD / 1M tokens
+    -- prices USD / 1M tokens
     in_token_price      NUMERIC(18, 8),
     out_token_price     NUMERIC(18, 8),
 
-    -- para modelos hosted
+    -- for hosted models
     cost_per_second     NUMERIC(18, 8),
 
-    -- máximo de llamadas simultáneas a este modelo (rate limit propio del
-    -- proveedor/cuenta). NULL = sin límite explícito definido todavía.
+    -- maximum concurrent calls to this model (provider/account-specific
+    -- rate limit). NULL = no explicit limit defined yet.
     concurrency         INTEGER,
 
-    -- timeout de la llamada HTTP a este modelo, en segundos.
+    -- timeout for the HTTP call to this model, in seconds.
     timeout_seconds     INTEGER NOT NULL DEFAULT 300,
 
-    -- temperatura a usar al llamar este modelo. NULL = default del proveedor.
-    -- Config por modelo, no por request (ver app/clients/llm_client.py).
+    -- temperature to use when calling this model. NULL = provider default.
+    -- Configured per model, not per request (see app/clients/llm_client.py).
     temperature         NUMERIC(8, 4),
 
-    -- candidate: se rutea/genera soluciones con él (pueden convivir varios
-    -- activos, pero con name distinto entre sí). feature: calcula features
-    -- vía LLM. judge: califica soluciones de tareas custom. Solo puede
-    -- haber UN modelo activo con role='feature' y UN modelo activo con
-    -- role='judge' en total; para candidate, el límite es "a lo sumo uno
-    -- activo por name" (ver índices únicos parciales más abajo).
+    -- chat_completions (default, litellm.completion()) | responses (OpenAI's
+    -- new API, litellm.responses() — needed by some models that don't
+    -- expose (or don't fully support) Chat Completions).
+    api_kind            VARCHAR(50) NOT NULL DEFAULT 'chat_completions',
+
+    -- Maximum output tokens to request from the model. Some APIs require
+    -- it (e.g. Anthropic Messages), others take it as an optional limit
+    -- (Responses API: max_output_tokens). NULL = not sent.
+    max_tokens          INTEGER,
+
+    -- candidate: used to route/generate solutions (several can be active
+    -- at once, but each with a distinct name). feature: computes features
+    -- via LLM. judge: grades solutions for custom tasks. There can only be
+    -- ONE active model with role='feature' and ONE active model with
+    -- role='judge' in total; for candidate, the limit is "at most one
+    -- active per name" (see the partial unique indexes below).
     role                VARCHAR(50) NOT NULL,
 
-    -- Borrado lógico: cada POST /models/import reemplaza TODO el catálogo
-    -- (desactiva todos los existentes, activa solo los nuevos). En cascada
-    -- desactiva también solutions/grades/targets/model_metrics de los
-    -- modelos desactivados (ver app/services/cascade.py).
+    -- Logical delete: each POST /models/import replaces the ENTIRE catalog
+    -- (deactivates all existing ones, activates only the new ones). It
+    -- cascades to also deactivate solutions/grades/targets/model_metrics
+    -- of the deactivated models (see app/services/cascade.py).
     active              BOOLEAN NOT NULL DEFAULT TRUE
 );
 
@@ -146,8 +179,8 @@ CREATE TABLE routerkit.models (
 -- ============================================================
 -- 4. FEATURES
 --
--- Una fila por (task, question): la pregunta se ejecuta sobre la tarea
--- (LLM o script) y genera un valor de feature.
+-- One row per (task, question): the question is run against the task
+-- (LLM or script) and produces a feature value.
 -- ============================================================
 
 CREATE TABLE routerkit.features (
@@ -159,28 +192,28 @@ CREATE TABLE routerkit.features (
     -- llm | python
     source              VARCHAR(50),
 
-    -- valor obtenido de la pregunta
+    -- value obtained from the question
     value               NUMERIC,
 
-    -- respuesta literal del modelo antes del procesamiento
+    -- literal model response before processing
     answer_text         TEXT,
 
-    -- logprobs crudos de la respuesta (solo cuando source='llm'), serializados
-    -- como texto (ej. JSON del listado de {token, logprob} devuelto por el proveedor).
+    -- raw logprobs of the response (only when source='llm'), serialized as
+    -- text (e.g. JSON of the {token, logprob} list returned by the provider).
     answer_logprobs     TEXT,
 
-    -- consumo de tokens de la llamada (solo cuando source='llm')
+    -- token consumption of the call (only when source='llm')
     input_tokens        INTEGER,
     output_tokens       INTEGER,
 
-    -- telemetría de la llamada
+    -- call telemetry
     latency_ms          NUMERIC(18, 3),
     cost_usd            NUMERIC(18, 8),
 
-    -- Borrado lógico: recalcular features desactiva la fila activa anterior
-    -- de la misma (task_id, question_id) y crea una nueva. Solo puede haber
-    -- una fila activa por (task_id, question_id) a la vez (índice único
-    -- parcial más abajo).
+    -- Logical delete: recomputing features deactivates the previous active
+    -- row for the same (task_id, question_id) and creates a new one. There
+    -- can only be one active row per (task_id, question_id) at a time
+    -- (partial unique index below).
     active              BOOLEAN NOT NULL DEFAULT TRUE,
 
     FOREIGN KEY (task_id)
@@ -194,7 +227,7 @@ CREATE TABLE routerkit.features (
 -- ============================================================
 -- 5. SOLUTIONS
 --
--- Una fila por intento de solución generado (task + model candidato + sample).
+-- One row per generated solution attempt (task + candidate model + sample).
 -- ============================================================
 
 CREATE TABLE routerkit.solutions (
@@ -206,32 +239,31 @@ CREATE TABLE routerkit.solutions (
     -- 0 ... n_samples - 1
     sample_idx          INTEGER NOT NULL,
 
-    -- código generado
+    -- generated code
     code                TEXT,
 
-    -- consumo
+    -- consumption
     tokens_in           INTEGER,
     tokens_out          INTEGER,
 
-    -- telemetría
+    -- telemetry
     latency_ms          NUMERIC(18, 3),
     cost_usd            NUMERIC(18, 8),
 
-    -- NULL si la generación fue correcta
+    -- NULL if generation succeeded
     gen_error           TEXT,
 
-    -- Indicador explícito de que esta fila tuvo algún error (falló la
-    -- generación, falló el servicio, o cualquier otro motivo al cargarla).
-    -- Más simple de filtrar que null-checks sobre gen_error, y sirve
-    -- también para filas cargadas (type=load) que no necesariamente traen
-    -- un gen_error de texto.
+    -- Explicit indicator that this row had some error (generation failed,
+    -- the service failed, or any other reason during loading). Simpler to
+    -- filter than null-checks on gen_error, and also useful for loaded
+    -- rows (type=load) that don't necessarily carry a text gen_error.
     has_error           BOOLEAN NOT NULL DEFAULT FALSE,
 
-    -- Borrado lógico: regenerar soluciones de un model (POST
-    -- /solutions/generate, siempre por model_id) desactiva sus filas
-    -- activas anteriores para ese modelo y crea filas nuevas. Solo puede
-    -- haber una fila activa por (task_id, model_id, sample_idx) a la vez
-    -- (índice único parcial más abajo).
+    -- Logical delete: regenerating solutions for a model (POST
+    -- /solutions/generate, always by model_id) deactivates its previous
+    -- active rows for that model and creates new rows. There can only be
+    -- one active row per (task_id, model_id, sample_idx) at a time
+    -- (partial unique index below).
     active              BOOLEAN NOT NULL DEFAULT TRUE,
 
     FOREIGN KEY (task_id)
@@ -245,32 +277,43 @@ CREATE TABLE routerkit.solutions (
 -- ============================================================
 -- 6. GRADES
 --
--- Veredicto de una solución.
--- Relación 1:1 con solutions.
+-- Verdict for a solution. At most one ACTIVE grade per solution at a time
+-- (partial unique index below) — but, same as solutions/features, its own
+-- surrogate PK (not solution_id) so re-evaluating a solution follows the
+-- same logical-delete pattern as the rest of the system (deactivate +
+-- insert) instead of a one-off hard delete.
 -- ============================================================
 
 CREATE TABLE routerkit.grades (
-    solution_id         BIGINT PRIMARY KEY,
+    grade_id            BIGSERIAL PRIMARY KEY,
+
+    solution_id         BIGINT NOT NULL,
 
     -- tests | llm_judge
     grader              VARCHAR(50) NOT NULL,
 
     passed              BOOLEAN,
 
-    -- syntax | assert | timeout | judge_no | etc.
-    fail_reason         VARCHAR(255),
+    -- Free-form: a short status word (bigcodebench-api's `status`, e.g.
+    -- "fail"/"timeout"), or a full per-test-case traceback blob (JSON,
+    -- can run to several KB for real BigCodeBench runs) — unbounded on
+    -- purpose, whoever writes it decides the level of detail.
+    fail_reason         TEXT,
 
-    -- tiempo de ejecución del proceso de evaluación
+    -- execution time of the evaluation process
     exec_ms             NUMERIC(18, 3),
 
-    -- Indicador de que la validación en sí falló (timeout/caída de
-    -- bigcodebench-api, falla en la llamada al juez LLM, etc.) —
-    -- DISTINTO de que el evaluador haya determinado que la solución no
-    -- pasa (eso es passed=false + fail_reason). Con has_error=true, el
-    -- mensaje de la falla de infraestructura queda en fail_reason igual.
+    -- Indicates that the validation itself failed (timeout/crash of
+    -- bigcodebench-api, failure calling the LLM judge, etc.) — DIFFERENT
+    -- from the evaluator having determined that the solution doesn't pass
+    -- (that's passed=false + fail_reason). With has_error=true, the
+    -- infrastructure failure message still goes into fail_reason.
     has_error           BOOLEAN NOT NULL DEFAULT FALSE,
 
-    -- Se desactiva junto con su solution (ver app/services/cascade.py).
+    -- Logical delete: re-evaluating a solution (POST /solutions/validate)
+    -- deactivates its previous active grade (if any) and inserts a new row.
+    -- Also deactivated together with its solution when that solution is
+    -- deactivated (see app/services/cascade.py).
     active              BOOLEAN NOT NULL DEFAULT TRUE,
 
     FOREIGN KEY (solution_id)
@@ -282,8 +325,8 @@ CREATE TABLE routerkit.grades (
 -- ============================================================
 -- 7. TARGETS
 --
--- Resultado agregado utilizado como Y para entrenamiento.
--- Una fila por (task, model candidato).
+-- Aggregated result used as Y for training.
+-- One row per (task, candidate model).
 -- ============================================================
 
 CREATE TABLE routerkit.targets (
@@ -292,18 +335,17 @@ CREATE TABLE routerkit.targets (
     task_id             BIGINT NOT NULL,
     model_id            BIGINT NOT NULL,
 
-    -- cantidad de soluciones generadas
+    -- number of solutions generated
     n                   INTEGER NOT NULL,
 
-    -- cantidad de soluciones correctas
+    -- number of correct solutions
     k                   INTEGER NOT NULL,
 
     -- k / n
     pass_rate           NUMERIC NOT NULL,
 
-    -- Borrado lógico: se recalcula por completo (desactiva todo, inserta de
-    -- nuevo) cada vez que se agregan targets a partir de solutions/grades
-    -- activos.
+    -- Logical delete: fully recomputed (deactivates everything, inserts
+    -- anew) every time targets are aggregated from active solutions/grades.
     active              BOOLEAN NOT NULL DEFAULT TRUE,
 
     FOREIGN KEY (task_id)
@@ -317,7 +359,7 @@ CREATE TABLE routerkit.targets (
 -- ============================================================
 -- 8. MODEL_METRICS
 --
--- Métricas agregadas de un modelo candidato, sobre los targets activos.
+-- Aggregated metrics for a candidate model, over the active targets.
 -- ============================================================
 
 CREATE TABLE routerkit.model_metrics (
@@ -325,24 +367,24 @@ CREATE TABLE routerkit.model_metrics (
 
     model_id            BIGINT NOT NULL,
 
-    -- % tareas con al menos una solución correcta
+    -- % tasks with at least one correct solution
     taskpass_pct        NUMERIC,
 
-    -- % soluciones que compilan y terminan
+    -- % solutions that compile and finish
     complete_pct        NUMERIC,
 
-    -- promedio de pass_rate
+    -- average pass_rate
     pass_rate_avg       NUMERIC,
 
-    -- costos
+    -- costs
     cost_per_task       NUMERIC(18, 8),
     cost_total          NUMERIC(18, 8),
 
-    -- telemetría agregada
+    -- aggregated telemetry
     latency_avg_ms      NUMERIC(18, 3),
     tokens_out_avg      NUMERIC(18, 3),
 
-    -- Borrado lógico: se recalcula por completo, igual que targets.
+    -- Logical delete: fully recomputed, same as targets.
     active              BOOLEAN NOT NULL DEFAULT TRUE,
 
     FOREIGN KEY (model_id)
@@ -353,33 +395,47 @@ CREATE TABLE routerkit.model_metrics (
 -- ============================================================
 -- 9. PREDICTORS
 --
--- Modelos entrenados mediante AutoML, sobre features/targets activos.
+-- Models trained via AutoML, over active features/targets.
 -- ============================================================
 
 CREATE TABLE routerkit.predictors (
     predictor_id        BIGSERIAL PRIMARY KEY,
 
-    -- algoritmo/modelo ganador
+    -- winning algorithm/model
     algorithm           VARCHAR(255) NOT NULL,
 
-    -- métricas del modelo
+    -- model metrics
     cv_score            NUMERIC,
     test_r2             NUMERIC,
     test_mae            NUMERIC,
 
-    -- contrato de entrada del modelo:
-    -- questions/features esperadas y configuración asociada
+    -- model's input contract:
+    -- expected questions/features and associated configuration
     feature_columns     JSONB NOT NULL,
 
-    -- ubicación del modelo serializado (.joblib, etc.)
+    -- location of the serialized model (.joblib, etc.)
     artifact_path       TEXT,
 
     created_at          TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
-    is_production       BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Routing policy calibrated for THIS predictor's own Y_pred (score =
+    -- Y_pred - lambda * cost/cost_max, see app/services/routing_calibration.py).
+    -- Keyed by shot count ("1".."max shots"): {lambda, test_accuracy,
+    -- test_cost_avg} per key — the lambda that survived the elbow method
+    -- on the train-split Monte Carlo sweep, re-evaluated once on the test
+    -- split for the reported accuracy/cost.
+    routing_lambdas     JSONB,
 
-    -- No participa de la cascada automática (entrenar es un paso deliberado,
-    -- no se invalida solo porque cambiaron los datos de origen).
+    -- Full (lambda, accuracy, cost) sweep curve used to pick the winners
+    -- above, keyed by shot count — kept so the curve can be audited or
+    -- plotted later without re-running the whole Monte Carlo sweep.
+    lambda_sweep        JSONB,
+
+    -- Full replace, same pattern as the rest of the system: each
+    -- POST /train deactivates every existing predictor before inserting
+    -- the new one (see services/training.py) — there's only ever one
+    -- active predictor, and that's always the one POST /route uses. To go
+    -- back to an older one, retrain or reactivate it by hand.
     active              BOOLEAN NOT NULL DEFAULT TRUE
 );
 
@@ -387,7 +443,7 @@ CREATE TABLE routerkit.predictors (
 -- ============================================================
 -- 10. ROUTE_DECISIONS
 --
--- Cada decisión del router en producción + feedback.
+-- Each router decision in production + feedback.
 -- ============================================================
 
 CREATE TABLE routerkit.route_decisions (
@@ -395,25 +451,25 @@ CREATE TABLE routerkit.route_decisions (
 
     predictor_id        BIGINT NOT NULL,
 
-    -- modelo finalmente seleccionado
+    -- finally selected model
     winner_model_id     BIGINT NOT NULL,
 
-    -- momento de la decisión
+    -- moment of the decision
     ts                  TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
-    -- hash del prompt/request
+    -- hash of the prompt/request
     prompt_hash         VARCHAR(255),
 
-    -- features calculadas para esta request
+    -- features computed for this request
     features            JSONB,
 
-    -- predicciones/scores por candidato
+    -- predictions/scores per candidate
     ranking             JSONB,
 
-    -- indica si se utilizó el modelo fallback
+    -- indicates whether the fallback model was used
     used_fallback       BOOLEAN NOT NULL DEFAULT FALSE,
 
-    -- feedback real posterior
+    -- actual subsequent feedback
     outcome_success     BOOLEAN,
     outcome_cost_usd    NUMERIC(18, 8),
 
@@ -428,36 +484,36 @@ CREATE TABLE routerkit.route_decisions (
 -- ============================================================
 -- 11. JOBS
 --
--- Seguimiento de procesos async de larga duración (features/compute,
--- solutions/generate, evaluación...). Borrado lógico igual que el resto
--- del sistema: a lo sumo una fila ACTIVA por `kind` (índice único parcial
--- más abajo), que se va actualizando in-place (status/message/progress)
--- mientras corre. Arrancar un job nuevo del mismo kind desactiva la fila
--- anterior y crea una nueva — pero solo si la anterior ya terminó
--- (done/error); si sigue pending/running, se rechaza (409 a nivel de API)
--- en vez de pisar un proceso en curso. Al iniciar el container (lifespan
--- de app/main.py) se resetean TODOS los kinds conocidos: cualquier fila
--- que haya quedado 'running' de una instancia anterior (crash, redeploy)
--- se desactiva, y cada kind arranca con una fila nueva en status='empty'.
+-- Tracking of long-running async processes (features/compute,
+-- solutions/generate, evaluation...). Logical delete like the rest of the
+-- system: at most one ACTIVE row per `kind` (partial unique index below),
+-- which gets updated in-place (status/message/progress) while it runs.
+-- Starting a new job of the same kind deactivates the previous row and
+-- creates a new one — but only if the previous one already finished
+-- (done/error); if it's still pending/running, it's rejected (409 at the
+-- API level) instead of overwriting an in-progress process. On container
+-- startup (lifespan in app/main.py) ALL known kinds are reset: any row
+-- left 'running' from a previous instance (crash, redeploy) is
+-- deactivated, and each kind starts with a new row in status='empty'.
 -- ============================================================
 
 CREATE TABLE routerkit.jobs (
     job_id              BIGSERIAL PRIMARY KEY,
 
-    -- features_compute | solutions_generate | evaluation (a futuro)
+    -- features_compute | solutions_generate | evaluation (future)
     kind                VARCHAR(50) NOT NULL,
 
-    -- empty (recién reseteado, nunca corrió nada todavía) | pending (recién
-    -- creado, por arrancar) | running | done | error
+    -- empty (just reset, hasn't run anything yet) | pending (just created,
+    -- about to start) | running | done | error
     status              VARCHAR(20) NOT NULL DEFAULT 'empty',
 
-    -- progreso legible, ej. "4/1000 procesadas"
+    -- human-readable progress, e.g. "4/1000 processed"
     message             TEXT,
     progress_current    INTEGER,
     progress_total      INTEGER,
 
-    -- resultado final (mismo shape que devolvía el endpoint síncrono antes
-    -- de que esto fuera async), o el error si status='error'
+    -- final result (same shape the synchronous endpoint used to return
+    -- before this became async), or the error if status='error'
     result              JSONB,
     error               TEXT,
 
@@ -471,18 +527,22 @@ CREATE TABLE routerkit.jobs (
 -- ============================================================
 -- INDEXES
 --
--- PK ya genera índice automáticamente. Los índices únicos parciales
--- (WHERE active) son los que reemplazan las UNIQUE/PK compuestas que
--- tenían experiment_id: garantizan que solo exista una fila activa por
--- "identidad natural" (ej. una task+question, o una task+model+sample),
--- permitiendo que convivan filas históricas inactivas con esa misma
--- identidad.
+-- The PK already generates an index automatically. The partial unique
+-- indexes (WHERE active) are what replace the composite UNIQUE/PK
+-- constraints that used to include experiment_id: they guarantee that only
+-- one active row exists per "natural identity" (e.g. a task+question, or
+-- a task+model+sample), allowing inactive historical rows with that same
+-- identity to coexist.
 -- ============================================================
 
 -- tasks
 CREATE UNIQUE INDEX idx_tasks_bcb_task_id_active
     ON routerkit.tasks(bcb_task_id)
     WHERE bcb_task_id IS NOT NULL AND active;
+
+CREATE UNIQUE INDEX idx_tasks_custom_task_id_active
+    ON routerkit.tasks(custom_task_id)
+    WHERE custom_task_id IS NOT NULL AND active;
 
 CREATE INDEX idx_tasks_active
     ON routerkit.tasks(active);
@@ -492,24 +552,28 @@ CREATE INDEX idx_tasks_active
 CREATE INDEX idx_questions_active
     ON routerkit.questions(active);
 
+CREATE UNIQUE INDEX idx_questions_question_key_active
+    ON routerkit.questions(question_key)
+    WHERE question_key IS NOT NULL AND active;
+
 
 -- models
 CREATE INDEX idx_models_active
     ON routerkit.models(active);
 
--- A lo sumo un model activo con role='feature' y un model activo con
--- role='judge'. role='candidate' no tiene este límite (puede haber
--- muchos candidatos activos a la vez).
+-- At most one active model with role='feature' and one active model with
+-- role='judge'. role='candidate' has no such limit (many candidates can
+-- be active at the same time).
 CREATE UNIQUE INDEX idx_models_singleton_role_active
     ON routerkit.models(role)
     WHERE active AND role IN ('feature', 'judge');
 
--- A lo sumo un model activo por (name, role): permite varios candidates
--- activos a la vez (distintos name), pero nunca dos con el MISMO name en
--- el mismo role — necesario para poder buscar candidatos por nombre sin
--- ambigüedad (ver POST /solutions/generate). Ya no se soporta tener 2
--- cuentas del mismo modelo activas simultáneamente como candidate; para
--- eso hay que desactivar una y activar la otra.
+-- At most one active model per (name, role): allows several candidates to
+-- be active at once (distinct names), but never two with the SAME name in
+-- the same role — needed to be able to look up candidates by name without
+-- ambiguity (see POST /solutions/generate). Having 2 accounts of the same
+-- model active simultaneously as candidate is no longer supported; to do
+-- that, deactivate one and activate the other.
 CREATE UNIQUE INDEX idx_models_unique_name_role_active
     ON routerkit.models(name, role)
     WHERE active;
@@ -549,6 +613,10 @@ CREATE UNIQUE INDEX idx_solutions_natural_key_active
 CREATE INDEX idx_grades_active
     ON routerkit.grades(active);
 
+CREATE UNIQUE INDEX idx_grades_natural_key_active
+    ON routerkit.grades(solution_id)
+    WHERE active;
+
 
 -- targets
 CREATE INDEX idx_targets_task_id
@@ -578,11 +646,16 @@ CREATE UNIQUE INDEX idx_model_metrics_natural_key_active
 
 
 -- predictors
-CREATE INDEX idx_predictors_is_production
-    ON routerkit.predictors(is_production);
-
 CREATE INDEX idx_predictors_active
     ON routerkit.predictors(active);
+
+-- At most one active predictor at a time (unlike most tables, there's no
+-- natural key to scope this by — it's a single global singleton, same
+-- trick as idx_models_singleton_role_active but over a constant instead of
+-- a role column).
+CREATE UNIQUE INDEX idx_predictors_singleton_active
+    ON routerkit.predictors((1))
+    WHERE active;
 
 
 -- route_decisions
@@ -600,7 +673,7 @@ CREATE INDEX idx_route_decisions_ts
 CREATE INDEX idx_jobs_kind_started_at
     ON routerkit.jobs(kind, started_at DESC);
 
--- A lo sumo una fila activa por kind (el "actual" de ese tipo de proceso).
+-- At most one active row per kind (the "current" one for that process type).
 CREATE UNIQUE INDEX idx_jobs_unique_active_kind
     ON routerkit.jobs(kind)
     WHERE active;

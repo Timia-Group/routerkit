@@ -1,8 +1,8 @@
-"""ORM 1:1 con postgres/init/001_schema.sql (schema `routerkit`).
+"""ORM 1:1 with postgres/init/001_schema.sql (schema `routerkit`).
 
-Cualquier cambio de columnas/tablas debe reflejarse en ambos lugares. No hay
-tabla `experiments`: todo trabaja sobre lo activo (ver comentario al inicio
-del schema SQL).
+Any column/table change must be reflected in both places. There's no
+`experiments` table: everything works on what's active (see the comment at
+the top of the SQL schema).
 """
 
 from datetime import datetime
@@ -27,12 +27,16 @@ class Task(Base):
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=func.current_timestamp()
     )
-    # NULL = tarea custom (juez LLM). Con valor = tarea oficial del benchmark
-    # (bigcodebench-api la evalúa contra el dataset oficial).
+    # NULL = custom task (LLM judge). With a value = official benchmark task
+    # (bigcodebench-api evaluates it against the official dataset).
     bcb_task_id: Mapped[str | None] = mapped_column(String(255))
-    # Borrado lógico: una recarga del benchmark desactiva las filas viejas y
-    # crea filas nuevas en vez de actualizar (ver postgres/init/001_schema.sql).
-    # Todo proceso que busque tareas debe filtrar active=True.
+    # Stable key for custom tasks (analogous to bcb_task_id) — to reference
+    # them from features/solutions/validations without depending on the
+    # internal task_id (see app/services/tasks_catalog.py).
+    custom_task_id: Mapped[str | None] = mapped_column(String(255))
+    # Soft delete: reloading the benchmark deactivates the old rows and
+    # creates new ones instead of updating (see postgres/init/001_schema.sql).
+    # Any process that looks up tasks must filter on active=True.
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 
@@ -46,12 +50,18 @@ class Question(Base):
     hi: Mapped[Decimal | None] = mapped_column(Numeric)
     author: Mapped[str | None] = mapped_column(String(255))
     version: Mapped[str | None] = mapped_column(String(100))
+    # Stable key (e.g. "p41") to reference this question from
+    # features/solutions/validations without depending on the internal question_id.
+    question_key: Mapped[str | None] = mapped_column(String(255))
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    # NULL = se resuelve con LLM (el model con role='feature' activo). Con
-    # valor = texto de `def task_func(task_prompt): ...` (mismo nombre que
-    # el entry_point de BigCodeBench); se ejecuta directo (sin LLM) con el
-    # prompt de la tarea como input.
+    # NULL = resolved by LLM (the active model with role='feature'). With a
+    # value = text of `def task_func(task_prompt): ...` (same name as
+    # BigCodeBench's entry_point); it's executed directly (no LLM) with the
+    # task's prompt as input.
     script: Mapped[str | None] = mapped_column(Text)
+    # Times to repeat the LLM call and average (simple mean) the result.
+    # Ignored for a script question (always computed once, deterministic).
+    repetitions: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
 
 
 class Model(Base):
@@ -63,20 +73,25 @@ class Model(Base):
     provider: Mapped[str | None] = mapped_column(String(255))
     endpoint: Mapped[str | None] = mapped_column(Text)
     deployment: Mapped[str | None] = mapped_column(String(255))
-    # Nombre de var. de entorno a usar para este modelo (permite varias keys
-    # del mismo provider). NULL = convención fija por provider (llm_client.py).
+    # Name of the env var to use for this model (allows several keys for
+    # the same provider). NULL = fixed per-provider convention (llm_client.py).
     api_key_env: Mapped[str | None] = mapped_column(String(255))
     in_token_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
     out_token_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
     cost_per_second: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
-    # Máximo de llamadas simultáneas a este modelo. NULL = sin límite definido.
+    # Maximum simultaneous calls to this model. NULL = no limit defined.
     concurrency: Mapped[int | None] = mapped_column(Integer)
-    # Timeout de la llamada HTTP a este modelo, en segundos.
+    # Timeout of the HTTP call to this model, in seconds.
     timeout_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=300)
-    # Temperatura a usar al llamar este modelo. NULL = default del proveedor.
+    # Temperature to use when calling this model. NULL = provider default.
     temperature: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
-    # candidate (varios activos a la vez) | feature | judge (a lo sumo uno
-    # activo de cada uno, ver idx_models_singleton_role_active).
+    # chat_completions (default, litellm.completion()) | responses
+    # (litellm.responses(), OpenAI's new API).
+    api_kind: Mapped[str] = mapped_column(String(50), nullable=False, default="chat_completions")
+    # Maximum output tokens to request from the model. NULL = not sent.
+    max_tokens: Mapped[int | None] = mapped_column(Integer)
+    # candidate (several active at once) | feature | judge (at most one
+    # active of each, see idx_models_singleton_role_active).
     role: Mapped[str] = mapped_column(String(50), nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
@@ -92,15 +107,15 @@ class Feature(Base):
     source: Mapped[str | None] = mapped_column(String(50))  # llm | python
     value: Mapped[Decimal | None] = mapped_column(Numeric)
     answer_text: Mapped[str | None] = mapped_column(Text)
-    # Logprobs crudos de la respuesta (solo source='llm'), serializados como texto.
+    # Raw logprobs of the response (source='llm' only), serialized as text.
     answer_logprobs: Mapped[str | None] = mapped_column(Text)
     input_tokens: Mapped[int | None] = mapped_column(Integer)
     output_tokens: Mapped[int | None] = mapped_column(Integer)
     latency_ms: Mapped[Decimal | None] = mapped_column(Numeric(18, 3))
     cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
-    # Borrado lógico: a lo sumo una fila activa por (task_id, question_id)
-    # (ver idx_features_natural_key_active). Se desactiva en cascada cuando
-    # se desactiva su task o su question (services/cascade.py).
+    # Soft delete: at most one active row per (task_id, question_id)
+    # (see idx_features_natural_key_active). Deactivated in cascade when
+    # its task or its question is deactivated (services/cascade.py).
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 
@@ -119,30 +134,31 @@ class Solution(Base):
     latency_ms: Mapped[Decimal | None] = mapped_column(Numeric(18, 3))
     cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
     gen_error: Mapped[str | None] = mapped_column(Text)
-    # Indicador explícito de error (generación, servicio, o carga externa),
-    # independiente de si gen_error trae texto o no.
+    # Explicit error flag (generation, service, or external load),
+    # independent of whether gen_error carries text or not.
     has_error: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    # Borrado lógico: a lo sumo una fila activa por (task_id, model_id,
-    # sample_idx) (ver idx_solutions_natural_key_active). Se desactiva en
-    # cascada cuando se desactiva su task o su model.
+    # Soft delete: at most one active row per (task_id, model_id,
+    # sample_idx) (see idx_solutions_natural_key_active). Deactivated in
+    # cascade when its task or its model is deactivated.
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 
 class Grade(Base):
     __tablename__ = "grades"
 
+    grade_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     solution_id: Mapped[int] = mapped_column(
         BigInteger,
         ForeignKey("routerkit.solutions.solution_id", ondelete="CASCADE"),
-        primary_key=True,
+        nullable=False,
     )
     grader: Mapped[str] = mapped_column(String(50), nullable=False)  # tests | llm_judge
     passed: Mapped[bool | None] = mapped_column(Boolean)
-    fail_reason: Mapped[str | None] = mapped_column(String(255))
+    fail_reason: Mapped[str | None] = mapped_column(Text)
     exec_ms: Mapped[Decimal | None] = mapped_column(Numeric(18, 3))
-    # Falló la validación en sí (infra), distinto de passed=false.
+    # The validation itself failed (infra), different from passed=false.
     has_error: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    # Borrado lógico en cascada: se desactiva cuando se desactiva su solution.
+    # Cascading soft delete: deactivated when its solution is deactivated.
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 
@@ -157,8 +173,8 @@ class Target(Base):
     n: Mapped[int] = mapped_column(Integer, nullable=False)
     k: Mapped[int] = mapped_column(Integer, nullable=False)
     pass_rate: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
-    # Borrado lógico: a lo sumo una fila activa por (task_id, model_id) (ver
-    # idx_targets_natural_key_active). Se recalcula por completo cada vez.
+    # Soft delete: at most one active row per (task_id, model_id) (see
+    # idx_targets_natural_key_active). Fully recomputed each time.
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 
@@ -176,8 +192,8 @@ class ModelMetric(Base):
     cost_total: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
     latency_avg_ms: Mapped[Decimal | None] = mapped_column(Numeric(18, 3))
     tokens_out_avg: Mapped[Decimal | None] = mapped_column(Numeric(18, 3))
-    # Borrado lógico: a lo sumo una fila activa por model_id (ver
-    # idx_model_metrics_natural_key_active). Se recalcula por completo.
+    # Soft delete: at most one active row per model_id (see
+    # idx_model_metrics_natural_key_active). Fully recomputed.
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 
@@ -194,8 +210,16 @@ class Predictor(Base):
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=func.current_timestamp()
     )
-    is_production: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    # No participa de la cascada automática (entrenar es deliberado).
+    # Routing policy calibrated for this predictor's own Y_pred, keyed by
+    # shot count: {lambda, test_accuracy, test_cost_avg} per key (see
+    # services/routing_calibration.py).
+    routing_lambdas: Mapped[dict | None] = mapped_column(JSONB)
+    # Full (lambda, accuracy, cost) sweep curve, keyed by shot count — kept
+    # for later audit/plotting without re-running the Monte Carlo sweep.
+    lambda_sweep: Mapped[dict | None] = mapped_column(JSONB)
+    # Full replace: POST /train deactivates every existing predictor before
+    # inserting the new one — there's only ever one active predictor, and
+    # that's always the one POST /route uses (see services/training.py).
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 
@@ -224,7 +248,7 @@ class Job(Base):
     __tablename__ = "jobs"
 
     job_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    # features_compute | solutions_generate | evaluation (a futuro)
+    # features_compute | solutions_generate | evaluation (future)
     kind: Mapped[str] = mapped_column(String(50), nullable=False)
     # empty | pending | running | done | error
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="empty")
@@ -237,8 +261,9 @@ class Job(Base):
         TIMESTAMP(timezone=True), server_default=func.current_timestamp()
     )
     finished_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
-    # Borrado lógico: a lo sumo una fila activa por kind (ver
-    # idx_jobs_unique_active_kind). Arrancar un job nuevo desactiva la
-    # anterior (si ya terminó) y crea una nueva; al iniciar el container se
-    # resetean todas a status='empty' (ver app.services.jobs).
+    # Soft delete: at most one active row per kind (see
+    # idx_jobs_unique_active_kind). Starting a new job deactivates the
+    # previous one (if it already finished) and creates a new one; on
+    # container startup all of them are reset to status='empty' (see
+    # app.services.jobs).
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)

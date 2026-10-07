@@ -1,12 +1,15 @@
-"""Features programáticas: ejecuta `question.script` sobre `task.prompt`.
+"""Programmatic features: executes `question.script` on `task.prompt`.
 
-`question.script` (cuando está definido) es el texto de una función Python
-completa, con firma fija `def task_func(task_prompt: str) -> float` (mismo
-nombre de función que usa BigCodeBench como entry_point de sus tareas). Se
-hace `exec()` del texto en un namespace aislado, se toma la función
-`task_func` de ahí y se la llama con `task.prompt`. Sin sandbox ni timeout
-propios (decisión explícita): se asume que quien escribe questions.json es
-de confianza.
+`question.script` (when defined) is the text of a complete Python
+function, with fixed signature `def task_func(task_prompt: str) -> float`
+(the same function name BigCodeBench uses as the entry_point of its
+tasks). The text is `exec()`'d in an isolated namespace, the `task_func`
+function is taken from it, and it's called with `task.prompt`. No sandbox
+or timeout of our own (an explicit decision): whoever writes questions.json
+is assumed to be trusted. `question.repetitions` is ignored here — a
+script is deterministic, repeating it would just recompute the exact same
+value (unlike features_llm.compute_llm_feature, where it guards against
+the LLM's answer varying between calls).
 """
 
 import time
@@ -16,7 +19,7 @@ from app.db.models import Question, Task
 
 
 class ScriptError(RuntimeError):
-    """El script de la question no define `task_func`, o `task_func` lanzó una excepción."""
+    """The question's script doesn't define `task_func`, or `task_func` raised an exception."""
 
 
 @dataclass
@@ -26,33 +29,34 @@ class PythonFeatureResult:
 
 
 def compute_python_feature(task: Task, question: Question) -> PythonFeatureResult:
-    """Ejecuta `question.script` con `task.prompt` y devuelve el valor calculado.
+    """Executes `question.script` with `task.prompt` and returns the computed value.
 
-    Precondición: `question.script` no es None (si lo es, esta pregunta debe
-    resolverse con features_llm.compute_llm_feature en su lugar).
-    Lanza ScriptError si el script no define `task_func`, o si `task_func`
-    lanza una excepción al ejecutarse; el caller (routers/features.py) decide
-    qué hacer con ese error (por convención: se reporta y se sigue con las demás).
+    Precondition: `question.script` is not None (if it is, this question
+    must be resolved with features_llm.compute_llm_feature instead).
+    Raises ScriptError if the script doesn't define `task_func`, or if
+    `task_func` raises an exception when executed; the caller
+    (routers/features.py) decides what to do with that error (by
+    convention: it's reported and processing continues with the others).
     """
     if not question.script:
-        raise ScriptError(f"question {question.question_id} no tiene script definido")
+        raise ScriptError(f"question {question.question_id} has no script defined")
 
     namespace: dict = {}
     started = time.perf_counter()
     try:
-        exec(question.script, namespace)  # noqa: S102 - script de confianza, curado por el equipo
+        exec(question.script, namespace)  # noqa: S102 - trusted script, curated by the team
         task_func = namespace.get("task_func")
         if task_func is None:
-            raise ScriptError(f"question {question.question_id}: el script no define 'task_func'")
+            raise ScriptError(f"question {question.question_id}: the script doesn't define 'task_func'")
         value = float(task_func(task.prompt))
     except ScriptError:
         raise
-    except Exception as exc:  # noqa: BLE001 - se reporta como ScriptError al caller
+    except Exception as exc:  # noqa: BLE001 - reported as ScriptError to the caller
         raise ScriptError(f"question {question.question_id}: {exc}") from exc
 
     if question.kind == "binary" and value not in (0.0, 1.0):
         raise ScriptError(
-            f"question {question.question_id}: kind='binary' requiere 0 o 1, el script devolvió {value}"
+            f"question {question.question_id}: kind='binary' requires 0 or 1, the script returned {value}"
         )
 
     latency_ms = (time.perf_counter() - started) * 1000

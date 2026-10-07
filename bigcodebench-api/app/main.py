@@ -15,11 +15,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="bigcodebench-api",
     description=(
-        "Wrapper HTTP sobre BigCodeBench. `POST /jobs` + `GET /jobs/{id}` "
-        "evalúan una solución candidata contra el test oficial de un "
-        "`bcb_task_id`, de forma asíncrona (job/polling). No expone el "
-        "dataset oficial: routerkit-api nunca lo pide, el usuario siempre "
-        "sube su propio JSON de tareas."
+        "HTTP wrapper over BigCodeBench. `POST /jobs` + `GET /jobs/{id}` "
+        "evaluate a candidate solution against the official test of a "
+        "`bcb_task_id`, asynchronously (job/polling). It does not expose "
+        "the official dataset: routerkit-api never requests it, the user "
+        "always uploads their own task JSON."
     ),
     version="0.1.0",
     lifespan=lifespan,
@@ -41,7 +41,7 @@ def create_job(request: EvaluateRequest) -> JobCreatedResponse:
 def get_job(job_id: str) -> JobStatusResponse:
     job = jobs.get_job(job_id)
     if job is None:
-        raise HTTPException(status_code=404, detail="job no encontrado")
+        raise HTTPException(status_code=404, detail="job not found")
     return JobStatusResponse(
         job_id=job.job_id,
         status=job.status,

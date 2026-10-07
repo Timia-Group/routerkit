@@ -1,40 +1,57 @@
 {
   "models": [
     {
-      "name": "gpt-4o-mini",
+      "name": "Claude Sonnet 5",
       "type": "api",
-      "provider": "openai",
-      "api_key_env": "OPENAI_API_KEY",
-      "in_token_price": 0.15,
-      "out_token_price": 0.6,
+      "provider": "azure_anthropic",
+      "deployment": "claude-sonnet-5",
+      "endpoint": "https://<YOUR_AZURE_FOUNDRY_RESOURCE>.services.ai.azure.com/anthropic",
+      "api_key_env": "AZURE_FOUNDRY_API_KEY",
+      "api_kind": "chat_completions",
+      "in_token_price": 2.00,
+      "out_token_price": 10.00,
+      "concurrency": 20,
+      "max_tokens": 4096,
       "role": "candidate"
     },
     {
-      "name": "gpt-4o",
+      "name": "GPT-5.6 Luna",
       "type": "api",
-      "provider": "openai",
-      "api_key_env": "OPENAI_API_KEY_2",
-      "in_token_price": 2.5,
-      "out_token_price": 10,
+      "provider": "azure",
+      "deployment": "gpt-5.6-luna",
+      "endpoint": "https://<YOUR_AZURE_FOUNDRY_RESOURCE>.openai.azure.com",
+      "api_key_env": "AZURE_FOUNDRY_API_KEY",
+      "api_kind": "responses",
+      "in_token_price": 0.20,
+      "out_token_price": 1.20,
+      "concurrency": 50,
       "role": "candidate"
     },
     {
-      "name": "gpt-4o-mini",
+      "name": "Claude Sonnet 5",
       "type": "api",
-      "provider": "openai",
-      "api_key_env": "OPENAI_API_KEY",
-      "in_token_price": 0.15,
-      "out_token_price": 0.6,
-      "concurrency": 5,
-      "timeout_seconds": 120,
-      "role": "feature"
-    },
-    {
-      "name": "claude-sonnet-5",
-      "type": "api",
-      "provider": "anthropic",
-      "api_key_env": "ANTHROPIC_API_KEY",
+      "provider": "azure_anthropic",
+      "deployment": "claude-sonnet-5",
+      "endpoint": "https://<YOUR_AZURE_FOUNDRY_RESOURCE>.services.ai.azure.com/anthropic",
+      "api_key_env": "AZURE_FOUNDRY_API_KEY",
+      "api_kind": "chat_completions",
+      "in_token_price": 2.00,
+      "out_token_price": 10.00,
+      "concurrency": 20,
+      "max_tokens": 4096,
       "role": "judge"
+    },
+    {
+      "name": "gpt-5.4",
+      "type": "api",
+      "provider": "azure",
+      "deployment": "gpt-5.4",
+      "endpoint": "https://<YOUR_AZURE_FOUNDRY_RESOURCE>.openai.azure.com",
+      "api_key_env": "AZURE_OPENAI_API_KEY",
+      "api_kind": "responses",
+      "in_token_price": 2.50,
+      "out_token_price": 15.00,
+      "role": "feature"
     }
   ]
 }

@@ -1,8 +1,16 @@
-"""Política de ruteo en producción: elige el candidato ganador dado el predictor.
+"""Production routing policy: picks the winning candidate given the
+predictor's predictions. Mirrors the reference experiment's rule exactly:
 
-Pendiente de definir (más adelante, junto con el usuario): λ (trade-off
-calidad/costo), p_min (umbral mínimo de elegibilidad), exclusiones manuales
-de candidatos, y la lógica de fallback si el primer intento falla.
+    score(m) = Y_pred(task, m) - lambda * cost(m) / cost_max
+
+`lambda` is chosen per shot count by services.routing_calibration at
+training time (routerkit.predictors.routing_lambdas) — this function just
+applies it, it doesn't pick it. No `p_min` (minimum eligibility threshold)
+or manual exclusions: the reference experiment doesn't have either. The
+routing endpoint (routers/routing.py) always scores every active
+candidate in one pass and returns the full ranking as "the suggested
+execution order" — there's no notion of excluding already-tried models
+here, since nothing is tried yet when this runs.
 """
 
 from dataclasses import dataclass
@@ -12,20 +20,23 @@ from dataclasses import dataclass
 class RoutingDecision:
     winner_model_id: int
     ranking: list[dict]
-    used_fallback: bool
 
 
-def score_and_select(
-    task_features: dict, candidates: list[dict]
-) -> RoutingDecision | None:
-    """Aplica la política de ruteo (score = p - λ*precio, p_min, exclusiones, fallback).
-
-    Entrada: task_features (vector de features ya calculado para la tarea
-    nueva), candidates (lista de {model_id, p, price} con la probabilidad de
-    éxito predicha por el predictor y el precio normalizado de cada
-    candidato).
-    Salida esperada: RoutingDecision (modelo ganador, ranking completo de
-    candidatos con sus scores, si se recurrió al fallback).
-    Devuelve None mientras no esté implementado.
+def score_and_select(candidates: list[dict], *, lam: float, cost_max: float) -> RoutingDecision:
+    """Scores and ranks `candidates` (each `{model_id, model_name, p,
+    price}` — `p` = Y_pred, `price` = cost per task), returns the winner
+    (highest score) plus the full ranking, best first. Raises ValueError
+    if `candidates` is empty.
     """
-    pass
+    if not candidates:
+        raise ValueError("no candidates to score")
+
+    ranking = [
+        {**c, "score": c["p"] - lam * c["price"] / cost_max} for c in candidates
+    ]
+    ranking.sort(key=lambda c: -c["score"])
+
+    return RoutingDecision(
+        winner_model_id=ranking[0]["model_id"],
+        ranking=ranking,
+    )

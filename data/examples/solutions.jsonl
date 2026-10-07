@@ -1,0 +1,2 @@
+{"model_name": "gpt-4o-mini", "custom_task_id": "add-two-integers", "sample_idx": 0, "code": "```python\ndef add(a, b):\n    return a + b\n```", "tokens_in": 85, "tokens_out": 22, "latency_ms": 610.4, "cost_usd": 0.0000271}
+{"model_name": "gpt-4o", "bcb_task_id": "BigCodeBench/0", "sample_idx": 0, "gen_error": "rate limit exceeded", "has_error": true}

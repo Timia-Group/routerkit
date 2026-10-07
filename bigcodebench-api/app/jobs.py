@@ -1,8 +1,8 @@
-"""Estado de jobs en memoria del proceso (sin Redis, decisión explícita).
+"""In-process-memory job state (no Redis, deliberate decision).
 
-Un job en curso se pierde si el contenedor se reinicia; aceptado para esta
-primera implementación. `evaluator.evaluate` es bloqueante (hace fork), por lo
-que corre en un ThreadPoolExecutor para no bloquear el event loop de FastAPI.
+A job in progress is lost if the container restarts; accepted for this
+first implementation. `evaluator.evaluate` is blocking (it forks), so it
+runs in a ThreadPoolExecutor to avoid blocking FastAPI's event loop.
 """
 
 import uuid
@@ -42,8 +42,8 @@ def _run(job_id: str, request: EvaluateRequest) -> None:
         job.status = JobStatus.DONE
     except KeyError:
         job.status = JobStatus.ERROR
-        job.error = f"bcb_task_id desconocido: {request.bcb_task_id!r}"
-    except Exception as exc:  # noqa: BLE001 - se reporta tal cual al caller
+        job.error = f"unknown bcb_task_id: {request.bcb_task_id!r}"
+    except Exception as exc:  # noqa: BLE001 - reported as-is to the caller
         job.status = JobStatus.ERROR
         job.error = str(exc)
 

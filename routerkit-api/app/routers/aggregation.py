@@ -9,11 +9,11 @@ router = APIRouter(tags=["aggregation"])
 
 @router.post("/aggregate")
 def aggregate(db: Session = Depends(get_db)) -> dict:
-    """Recalcula targets y model_metrics a partir de las solutions/grades activas.
+    """Recomputes targets and model_metrics from the active solutions/grades.
 
-    Reemplazo completo (con borrado lógico): desactiva todos los targets y
-    model_metrics existentes y crea filas nuevas activas a partir de las
-    solutions activas (y sus grades).
+    Full replacement (with soft delete): deactivates all existing targets and
+    model_metrics and creates new active rows from the active solutions (and
+    their grades).
     """
     n_targets = aggregation.recompute_targets(db)
     n_metrics = aggregation.recompute_model_metrics(db)

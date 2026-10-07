@@ -5,8 +5,8 @@ from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.config import settings
 
-# El schema real vive en el schema de Postgres "routerkit" (ver
-# postgres/init/001_schema.sql), no en "public".
+# The actual schema lives in the Postgres schema "routerkit" (see
+# postgres/init/001_schema.sql), not in "public".
 metadata = MetaData(schema="routerkit")
 
 

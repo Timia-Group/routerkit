@@ -1,15 +1,16 @@
-"""Import de catálogos (tasks.jsonl, questions.json, models.json) a Postgres.
+"""Catalog import (tasks.jsonl, questions.json, models.json) into Postgres.
 
-Todo input es JSON (estandarizado). Los 3 endpoints reciben un archivo
-(multipart) y devuelven cuántas filas se crearon/desactivaron. El shape y
-los valores aceptados de cada fila están documentados en `app.schemas`
-(TaskImportRow, QuestionImportRow, ModelImportRow) y se validan antes de
-insertar: una fila inválida aborta el import completo con 422 y el detalle
-del error. Los 3 son un reemplazo con borrado lógico (cascada incluida vía
-app.services.cascade): desactivan lo existente y activan solo lo de la
-última carga, nunca tocan una fila ya usada por un experimento anterior.
-Además, cada uno deja un snapshot del estado activo resultante en
-data/current (rotando el anterior a data/previous, ver app.services.snapshots).
+All input is JSON (standardized). The 3 endpoints receive a file (multipart)
+and return how many rows were created/deactivated. The shape and accepted
+values of each row are documented in `app.schemas` (TaskImportRow,
+QuestionImportRow, ModelImportRow) and are validated before inserting: an
+invalid row aborts the whole import with 422 and the error detail. All 3 are
+a replacement with soft delete (cascade included via app.services.cascade):
+they deactivate what exists and activate only what came in the latest
+upload, never touching a row already used by a previous experiment.
+Additionally, each one leaves a snapshot of the resulting active state in
+data/current (rotating the previous one to data/previous, see
+app.services.snapshots).
 """
 
 import json
@@ -37,45 +38,50 @@ def _validation_error(item: str, exc: ValidationError) -> HTTPException:
 
 
 def _parse_json_object(raw: str) -> dict | list:
-    """Parsea el body de un archivo .json de import. 400 si no es JSON válido."""
+    """Parses the body of an import .json file. 400 if it's not valid JSON."""
     if not raw.strip():
         return {}
     try:
         return json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=400, detail=f"JSON inválido: {exc}") from exc
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {exc}") from exc
 
 
 @router.post(
     "/tasks/import",
-    summary="Reemplaza TODAS las tareas activas desde un tasks.jsonl provisto por el usuario",
+    summary="Replaces ALL active tasks from a tasks.jsonl file provided by the user",
 )
 async def import_tasks(
-    file: UploadFile = File(description="tasks.jsonl: una tarea JSON por línea."),
+    file: UploadFile = File(description="tasks.jsonl: one JSON task per line."),
     db: Session = Depends(get_db),
 ) -> dict:
-    """Reemplaza (con borrado lógico) TODAS las tasks activas en
-    `routerkit.tasks` por las de este archivo.
+    """Replaces (with soft delete) ALL active tasks in `routerkit.tasks`
+    with the ones in this file.
 
-    Al arrancar, `routerkit-api` ya carga automáticamente el catálogo
-    oficial de BigCodeBench (1140 tasks) si la tabla está vacía (ver
-    `app.services.seed`) — este endpoint es para cuando el usuario quiere
-    reemplazar ese catálogo por otro propio. Cada línea decide su tipo por
-    sí misma vía `bcb_task_id`: con valor (ej. "BigCodeBench/12") es una
-    tarea del benchmark oficial, sin valor es una tarea custom — un mismo
-    archivo puede traer ambas mezcladas libremente. Ninguna API descarga el
-    dataset de BigCodeBench por su cuenta en este endpoint: si se quieren
-    tasks del benchmark acá, el jsonl las trae con su `bcb_task_id`.
+    On startup, `routerkit-api` already auto-loads the official BigCodeBench
+    catalog (1135 tasks) if the table is empty (see `app.services.seed`) —
+    this endpoint is for when the user wants to replace that catalog with
+    their own. Each line decides its own type via `bcb_task_id`: with a
+    value (e.g. "BigCodeBench/12") it's an official benchmark task, without
+    one it's a custom task — a single file can freely mix both. No API
+    downloads the BigCodeBench dataset on its own in this endpoint: if you
+    want benchmark tasks here, the jsonl must bring them with their
+    `bcb_task_id`.
 
-    Desactiva (`active=false`) TODAS las tasks existentes (cualquiera sea
-    su tipo) y crea filas nuevas con `active=true`; nunca toca una fila ya
-    usada por un experimento anterior.
+    Deactivates (`active=false`) ALL existing tasks (of any type) and
+    creates new rows with `active=true`; it never touches a row already
+    used by a previous experiment.
 
-    Cada línea debe cumplir `TaskImportRow` (`prompt` obligatorio; `tests`,
-    `entry_point`, `source`, `tags`, `bcb_task_id` opcionales). Ejemplo:
+    Each line must satisfy `TaskImportRow` (`prompt` required; `tests`,
+    `entry_point`, `source`, `tags`, `bcb_task_id`, `custom_task_id`
+    optional). If a custom task will later be referenced from
+    `features`/`solutions`/`validations` (`type=load`), assign it a
+    `custom_task_id` here — it's the stable key for custom tasks, analogous
+    to `bcb_task_id` for benchmark ones; the internal Postgres `task_id` is
+    never used for that (see `app.services.tasks_catalog`). Example:
 
     ```json
-    {"prompt": "Escribe una función que sume dos enteros.", "tests": "assert suma(2, 3) == 5", "entry_point": "suma", "source": "custom", "tags": ["math", "easy"]}
+    {"prompt": "Write a function that adds two integers.", "tests": "assert add(2, 3) == 5", "entry_point": "add", "source": "custom", "tags": ["math", "easy"], "custom_task_id": "add-two-integers"}
     ```
     """
     raw = (await file.read()).decode("utf-8")
@@ -85,38 +91,44 @@ async def import_tasks(
 
 @router.post(
     "/questions/import",
-    summary="Reemplaza el catálogo de preguntas de features desde questions.json",
+    summary="Replaces the features question catalog from questions.json",
 )
 async def import_questions(
-    file: UploadFile = File(description="questions.json: lista de preguntas."),
+    file: UploadFile = File(description="questions.json: list of questions."),
     db: Session = Depends(get_db),
 ) -> dict:
-    """Reemplaza (con borrado lógico) el catálogo de preguntas: desactiva
-    (`active=false`) TODAS las preguntas existentes y crea filas nuevas para
-    el archivo recién subido, con `active=true`. Mismo patrón que la recarga
-    de tareas: solo quedan activas las preguntas de la última carga.
+    """Replaces (with soft delete) the question catalog: deactivates
+    (`active=false`) ALL existing questions and creates new rows for the
+    just-uploaded file, with `active=true`. Same pattern as reloading
+    tasks: only the questions from the latest upload remain active.
 
-    Cada entrada debe cumplir `QuestionImportRow`: `text` y `kind` obligatorios
-    — `kind` acepta solo `binary` (sí/no, 0-1) o `numeric` (entero o decimal).
-    `lo`/`hi` acotan el rango esperado de la respuesta.
+    Each entry must satisfy `QuestionImportRow`: `text` and `kind` are
+    required — `kind` only accepts `binary` (yes/no, 0-1) or `numeric`
+    (integer or decimal). `lo`/`hi` bound the expected range of the answer.
 
-    `script` es opcional: si se omite, la pregunta se resuelve con el LLM
-    (el único model con role='feature' activo); si se define, debe ser el
-    texto de una función Python completa con firma fija
-    `def task_func(task_prompt: str) -> float` (mismo nombre de función que
-    usa BigCodeBench como entry_point) — se ejecuta directo con el prompt de
-    la tarea como único input, sin llamar a ningún LLM (costo cero).
+    `script` is optional: if omitted, the question is answered by the LLM
+    (the single active model with role='feature'); if provided, it must be
+    the full text of a Python function with a fixed signature
+    `def task_func(task_prompt: str) -> float` (same function name
+    BigCodeBench uses as entry_point) — it's executed directly with the
+    task's prompt as its only input, without calling any LLM (zero cost).
+
+    `question_key` is optional but recommended: it's the stable key (e.g.
+    "p41") to reference this question later from `features.jsonl`
+    (`type=load`) — never the internal Postgres `question_id`, which
+    changes on every reload of this catalog.
 
     ```json
     {
       "questions": [
-        {"text": "¿La solución usa recursión?", "kind": "binary", "lo": 0, "hi": 1, "author": "marcos", "version": "v1"},
+        {"text": "Does the solution use recursion?", "kind": "binary", "lo": 0, "hi": 1, "author": "marcos", "version": "v1", "question_key": "p1"},
         {
-          "text": "¿Cuántas líneas tiene el prompt de la tarea?",
+          "text": "How many lines does the task prompt have?",
           "kind": "numeric",
           "lo": 1,
           "hi": 200,
           "version": "v1",
+          "question_key": "p2",
           "script": "def task_func(task_prompt: str) -> float:\\n    return float(len(task_prompt.splitlines()))"
         }
       ]
@@ -150,8 +162,10 @@ async def import_questions(
                 hi=row.hi,
                 author=row.author,
                 version=row.version,
+                question_key=row.question_key,
                 active=True,
                 script=row.script,
+                repetitions=row.repetitions,
             )
         )
 
@@ -165,37 +179,74 @@ async def import_questions(
 
 @router.post(
     "/models/import",
-    summary="Reemplaza el catálogo de modelos candidatos/jueces desde models.json",
+    summary="Replaces the candidate/judge model catalog from models.json",
 )
 async def import_models(
-    file: UploadFile = File(description="models.json: lista de modelos."),
+    file: UploadFile = File(description="models.json: list of models."),
     db: Session = Depends(get_db),
 ) -> dict:
-    """Reemplaza (con borrado lógico) el catálogo de modelos: desactiva
-    (`active=false`) TODOS los modelos existentes y crea filas nuevas para
-    el archivo recién subido, con `active=true`. Mismo patrón que
-    tasks/questions — incluye cascada: al desactivar un modelo también se
-    desactivan sus `solutions` (y los `grades` de esas solutions), `targets`
-    y `model_metrics`.
+    """Replaces (with soft delete) the model catalog: deactivates
+    (`active=false`) ALL existing models and creates new rows for the
+    just-uploaded file, with `active=true`. Same pattern as
+    tasks/questions — includes cascade: deactivating a model also
+    deactivates its `solutions` (and the `grades` of those solutions),
+    `targets`, and `model_metrics`.
 
-    Cada entrada debe cumplir `ModelImportRow`: `type` acepta solo `api`
-    (se llama por HTTP a un proveedor externo) u `hosted` (se factura por
-    tiempo de cómputo propio); `role` acepta `candidate` (se rutea/genera
-    soluciones — pueden convivir varios activos, pero nunca dos con el
-    mismo `name`), `feature` (calcula features vía LLM) o `judge` (califica
-    soluciones de tareas custom) — de estos dos últimos solo puede haber
-    uno activo en total. `api_key_env` es opcional: si se omite,
-    `app.clients.llm_client` resuelve la key por una convención fija según
-    `provider` (ver `.env.example`) — `OPENAI_API_KEY`, `AZURE_OPENAI_API_KEY`,
-    `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, o `CUSTOM_LLM_API_KEY`. Si se
-    define, apunta a otra variable de entorno propia (útil para que
-    distintos modelos usen distintas cuentas del mismo provider).
-    `concurrency` (opcional, sin límite si se omite), `timeout_seconds`
-    (default 300) y `temperature` (opcional, default del proveedor si se
-    omite) controlan cómo se llama al modelo — `temperature` es config por
-    modelo, no por request. `concurrency` es importante para el model con
-    role='feature', ya que sus respuestas necesitan logprobs (no todos los
-    providers los exponen, ej. Anthropic no).
+    Each entry must satisfy `ModelImportRow`: `type` only accepts `api`
+    (called over HTTP to an external provider) or `hosted` (billed by its
+    own compute time); `role` accepts `candidate` (routed to/generates
+    solutions — several can be active at once, but never two with the same
+    `name`), `feature` (computes features via LLM), or `judge` (grades
+    solutions of custom tasks) — of these last two, only one can be active
+    in total. `api_key_env` is optional: if omitted,
+    `app.clients.llm_client` resolves the key by a fixed convention based on
+    `provider` (see `.env.example`) — `OPENAI_API_KEY`,
+    `AZURE_OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, or
+    `CUSTOM_LLM_API_KEY`. If set, it points to a different environment
+    variable of your own (useful so different models can use different
+    accounts of the same provider). `concurrency` (optional, unlimited if
+    omitted), `timeout_seconds` (default 300), and `temperature` (optional,
+    provider default if omitted) control how the model is called —
+    `temperature` is per-model config, not per-request. `concurrency`
+    matters for the model with role='feature', since its responses need
+    logprobs (not all providers expose them, e.g. Anthropic doesn't).
+
+    ### Recognized `provider` values (see `app.clients.llm_client._LITELLM_PREFIXES`)
+
+    - `openai` / `anthropic` / `openrouter`: native call to the provider,
+      always Chat Completions.
+    - `azure`: Azure OpenAI deployment (`endpoint` = the resource's base
+      URL). Most models respond via Chat Completions, but some deployments
+      (typically newer "reasoning" models) **only** expose the Responses
+      API — for those, `api_kind="responses"` (see below).
+    - `azure_anthropic`: Claude served from **Azure AI Foundry** (not the
+      same as plain `anthropic`): litellm routes it differently (`azure_ai/`
+      prefix), `endpoint` must point to the resource's
+      `.../services.ai.azure.com/anthropic` sub-path. It's still
+      `api_kind="chat_completions"` (Anthropic Messages, not the Responses
+      API).
+    - Any other value (e.g. a self-hosted gateway of your own): treated as
+      an OpenAI-compatible custom endpoint (`endpoint` = api_base,
+      `deployment`/`name` as-is). If that gateway carries no authentication
+      at all, add the provider's name to
+      `app.clients.llm_client._NO_AUTH_PROVIDERS` — `api_key` is never sent
+      to it, regardless of `api_key_env` or `CUSTOM_LLM_API_KEY`.
+
+    ### `api_kind`: which litellm method is used to call it
+
+    - `chat_completions` (default): `litellm.completion()` — classic Chat
+      Completions, what almost all the examples below already use.
+    - `responses`: `litellm.responses()` — OpenAI's Responses API. Use it
+      **only** when the specific deployment doesn't support Chat
+      Completions (it's not a preference, it's a deployment limitation —
+      see the `GPT-5.6 Sol` example below). ⚠️ This path hasn't been tested
+      against a real API in this repo yet (see the docstring of
+      `app.clients.llm_client._complete_responses`) — before relying on it
+      for a real run, it's worth validating it with an actual call.
+
+    `max_tokens` is optional; some APIs require it (e.g. Anthropic Messages
+    absolutely needs `max_tokens` — see the `Claude Sonnet 5` example
+    below).
 
     ```json
     {
@@ -210,25 +261,46 @@ async def import_models(
           "role": "candidate"
         },
         {
-          "name": "gpt-4o",
+          "name": "GPT-5.6 Sol",
           "type": "api",
-          "provider": "openai",
-          "api_key_env": "OPENAI_API_KEY_2",
-          "in_token_price": 2.50,
-          "out_token_price": 10.00,
+          "provider": "azure",
+          "deployment": "gpt-5.6-sol",
+          "endpoint": "https://<tu-recurso>.openai.azure.com",
+          "api_key_env": "AZURE_FOUNDRY_API_KEY",
+          "api_kind": "responses",
+          "in_token_price": 5.00,
+          "out_token_price": 30.00,
           "role": "candidate"
         },
         {
-          "name": "gpt-4o-mini",
+          "name": "Claude Sonnet 5",
           "type": "api",
-          "provider": "openai",
-          "in_token_price": 0.15,
-          "out_token_price": 0.60,
-          "concurrency": 5,
-          "timeout_seconds": 120,
-          "role": "feature"
+          "provider": "azure_anthropic",
+          "deployment": "claude-sonnet-5",
+          "endpoint": "https://<tu-recurso>.services.ai.azure.com/anthropic",
+          "api_key_env": "AZURE_FOUNDRY_API_KEY",
+          "max_tokens": 4096,
+          "role": "candidate"
         },
-        {"name": "claude-sonnet-5", "type": "api", "provider": "anthropic", "role": "judge"}
+        {
+          "name": "Qwen3.6-35B-A3B-FP8",
+          "type": "hosted",
+          "provider": "spheron",
+          "deployment": "qwen3.6-fp8",
+          "endpoint": "https://<spheron-gateway>",
+          "cost_per_second": 0.00061389,
+          "role": "candidate"
+        },
+        {
+          "name": "gpt-5.4-nano",
+          "type": "api",
+          "provider": "azure",
+          "deployment": "gpt-5.4-nano",
+          "endpoint": "https://<tu-recurso>.openai.azure.com",
+          "api_key_env": "AZURE_FOUNDRY_API_KEY",
+          "concurrency": 5,
+          "role": "feature"
+        }
       ]
     }
     ```
@@ -264,6 +336,8 @@ async def import_models(
                 concurrency=row.concurrency,
                 timeout_seconds=row.timeout_seconds,
                 temperature=row.temperature,
+                api_kind=row.api_kind,
+                max_tokens=row.max_tokens,
                 role=row.role,
                 active=True,
             )

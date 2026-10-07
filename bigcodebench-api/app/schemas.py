@@ -12,18 +12,18 @@ class JobStatus(str, Enum):
 
 
 class EvaluateRequest(BaseModel):
-    # task_id oficial de BigCodeBench, ej. "BigCodeBench/12".
+    # Official BigCodeBench task_id, e.g. "BigCodeBench/12".
     bcb_task_id: str
-    # código candidato a evaluar contra el test oficial de esa tarea.
+    # Candidate code to evaluate against that task's official test.
     solution: str
 
-    # límites de recursos opcionales (ver ADVANCED_USAGE.md de bigcodebench
-    # para los defaults del CLI oficial); permiten overridear evaluator.DEFAULT_LIMITS.
-    max_as_limit_mb: float | None = Field(default=None, description="Límite de address space (MB)")
-    max_data_limit_mb: float | None = Field(default=None, description="Límite de data segment (MB)")
-    max_stack_limit_mb: float | None = Field(default=None, description="Límite de stack (MB)")
-    min_time_limit_s: float | None = Field(default=None, description="Timeout mínimo de ejecución (s)")
-    gt_time_limit_s: float | None = Field(default=None, description="Timeout de la solución ground-truth (s)")
+    # Optional resource limits (see bigcodebench's ADVANCED_USAGE.md for the
+    # official CLI defaults); allow overriding evaluator.DEFAULT_LIMITS.
+    max_as_limit_mb: float | None = Field(default=None, description="Address space limit (MB)")
+    max_data_limit_mb: float | None = Field(default=None, description="Data segment limit (MB)")
+    max_stack_limit_mb: float | None = Field(default=None, description="Stack limit (MB)")
+    min_time_limit_s: float | None = Field(default=None, description="Minimum execution timeout (s)")
+    gt_time_limit_s: float | None = Field(default=None, description="Ground-truth solution timeout (s)")
 
 
 class JobCreatedResponse(BaseModel):

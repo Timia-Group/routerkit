@@ -1,18 +1,18 @@
-"""Generación de soluciones candidatas: le pide a un modelo que resuelva una tarea.
+"""Generation of candidate solutions: asks a model to solve a task.
 
-Prompt fijo (mismo que usa BigCodeBench para generar candidatos): no le
-agregamos nada sobre el nombre de función esperado ni ninguna otra
-instrucción — el enunciado (`task.prompt`) es responsable de especificar
-todo lo necesario, no lo controlamos nosotros. La respuesta del LLM se
-guarda tal cual viene (`code = response.text`, sin extraer ni limpiar
-bloques markdown ni nada más) — no se procesa ni se valida el código
-resultante (sintaxis, nombre de función, fences, etc.); eso es
-responsabilidad de la etapa de evaluación, no de esta.
+Fixed prompt (the same one BigCodeBench uses to generate candidates): we
+don't add anything about the expected function name or any other
+instruction — the statement (`task.prompt`) is responsible for specifying
+everything necessary, we don't control that. The LLM's response is stored
+exactly as it comes (`code = response.text`, without extracting or
+cleaning up markdown code blocks or anything else) — the resulting code is
+not processed or validated (syntax, function name, fences, etc.); that's
+the responsibility of the evaluation stage, not this one.
 
-Un fallo de la llamada al LLM (`LlmClientError`) no se propaga: se captura
-acá y se devuelve como `GenerationResult(code=None, gen_error=...)`, para
-que el caller pueda insertar igual una fila (histórico de que esa
-generación puntual falló) sin abortar el resto del lote.
+A failure of the LLM call (`LlmClientError`) is not propagated: it's caught
+here and returned as `GenerationResult(code=None, gen_error=...)`, so the
+caller can still insert a row (a record that this particular generation
+failed) without aborting the rest of the batch.
 """
 
 import time
@@ -39,11 +39,11 @@ class GenerationResult:
 
 
 def generate_solution(task: Task, model: Model) -> GenerationResult:
-    """Genera una solución candidata para `task` usando `model`.
+    """Generates a candidate solution for `task` using `model`.
 
-    `model.temperature` (si está definida) la resuelve app.clients.llm_client
-    solo; no se pasa temperatura por request. Nunca lanza: si la llamada al
-    LLM falla, devuelve un GenerationResult con `code=None` y `gen_error` seteado.
+    `model.temperature` (if defined) is resolved by app.clients.llm_client
+    alone; no temperature is passed per request. Never raises: if the LLM
+    call fails, returns a GenerationResult with `code=None` and `gen_error` set.
     """
     started = time.perf_counter()
     try:
@@ -60,11 +60,14 @@ def generate_solution(task: Task, model: Model) -> GenerationResult:
             gen_error=str(exc),
         )
 
+    latency_ms = (time.perf_counter() - started) * 1000
     return GenerationResult(
         code=response.text,
         tokens_in=response.prompt_tokens,
         tokens_out=response.completion_tokens,
-        latency_ms=(time.perf_counter() - started) * 1000,
-        cost_usd=llm_client.cost_usd(model, response.prompt_tokens, response.completion_tokens),
+        latency_ms=latency_ms,
+        cost_usd=llm_client.cost_usd(
+            model, response.prompt_tokens, response.completion_tokens, latency_ms=latency_ms
+        ),
         gen_error=None,
     )
