@@ -15,6 +15,7 @@
 - [Configuration](#configuration)
 - [Repo structure](#repo-structure)
 - [Current status and roadmap](#current-status-and-roadmap)
+- [License](#license)
 
 ## Architecture
 
@@ -232,3 +233,7 @@ routerkit/
 
 - **Automated test suite**: the system was validated through extensive manual/live testing against this project's own real dataset (see the [training report](#training-report)), not an automated regression suite — planned for a future release.
 - **Result export**: there's no dedicated endpoint to export the training dataset or routing history as a file — `route_decisions` (every `POST /route` call) and the training report's CSVs already cover most of what that would do; a standalone export format can be added if a concrete need for one comes up.
+
+## License
+
+[Apache License 2.0](LICENSE).
