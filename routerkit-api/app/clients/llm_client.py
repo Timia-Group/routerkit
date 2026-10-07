@@ -310,12 +310,10 @@ def _complete_responses(
     (OpenAI's Responses API) — needed by models with
     `model.api_kind == "responses"` (see the `models` schema).
 
-    NOT VERIFIED against the real API: there are no credentials or sandbox
-    in this development environment to test it. The shape of the response
-    (and in particular the structure of `logprobs`) was built based on the
-    public OpenAI/litellm documentation — before relying on this for a real
-    run of the experiment, it's worth validating it with an actual call and
-    adjusting `_extract_responses_logprobs` if needed.
+    Verified against a real deployment (an Azure-hosted model restricted to
+    the Responses API, not exposing Chat Completions at all) — this is
+    what resolved that model's `top_logprobs` limitation, see
+    `_extract_responses_logprobs`.
     """
     kwargs = _common_kwargs(model)
     kwargs["input"] = messages

@@ -145,7 +145,7 @@ File shape: `{"models": [ {...}, {...} ]}`.
 ### `api_kind`: which method is used to call the model
 
 - **`chat_completions`** (default): the "classic" method (Chat Completions). Works for almost everything.
-- **`responses`**: OpenAI's Responses API — use it **only** if that specific deployment doesn't respond to Chat Completions (this isn't a style preference, it's a real limitation of the deployment — happens with some newer "reasoning" models served via Azure). ⚠️ This path hasn't been tested against a real API yet — if your model needs it, flag it so it can be validated before a real run.
+- **`responses`**: OpenAI's Responses API — use it **only** if that specific deployment doesn't respond to Chat Completions (this isn't a style preference, it's a real limitation of the deployment — happens with some newer "reasoning" models served via Azure). Verified against a real deployment that needed it (also what resolved that model's `top_logprobs` cap — Chat Completions limits it to 5, Responses doesn't).
 
 ### Logprobs (matters for `role="feature"`)
 

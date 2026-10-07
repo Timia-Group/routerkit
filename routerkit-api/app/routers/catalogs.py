@@ -242,10 +242,9 @@ async def import_models(
     - `responses`: `litellm.responses()` — OpenAI's Responses API. Use it
       **only** when the specific deployment doesn't support Chat
       Completions (it's not a preference, it's a deployment limitation —
-      see the `GPT-5.6 Sol` example below). ⚠️ This path hasn't been tested
-      against a real API in this repo yet (see the docstring of
-      `app.clients.llm_client._complete_responses`) — before relying on it
-      for a real run, it's worth validating it with an actual call.
+      see the `GPT-5.6 Sol` example below). Verified against a real
+      deployment that needed it (see
+      `app.clients.llm_client._complete_responses`).
 
     `max_tokens` is optional; some APIs require it (e.g. Anthropic Messages
     absolutely needs `max_tokens` — see the `Claude Sonnet 5` example
