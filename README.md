@@ -1,8 +1,8 @@
 # RouterKit
 
-**RouterKit** is a platform for training and serving an LLM *router* for programming tasks: given a catalog of coding tasks, it generates solutions with different candidate LLMs, evaluates them (real tests via [BigCodeBench](https://github.com/bigcode-project/bigcodebench) or an LLM judge), aggregates the results as a training dataset, and (eventually) trains a predictor that picks, in production, which LLM is best suited for a new task, balancing quality vs. cost.
+**RouterKit** is a platform for training and serving an LLM *router* for programming tasks: given a catalog of coding tasks, it generates solutions with different candidate LLMs, evaluates them (real tests via [BigCodeBench](https://github.com/bigcode-project/bigcodebench) or an LLM judge), aggregates the results as a training dataset, trains a predictor that picks which LLM is best suited for a new task (balancing quality vs. cost), and serves that predictor in production via `POST /route`.
 
-> **Status**: the data pipeline (catalogs → features → generation → evaluation → aggregation) is complete and functional. Predictor training (AutoML), the production routing policy, and result export are **not implemented yet** — see [Current status and roadmap](#current-status-and-roadmap).
+> **Status**: the full pipeline is complete and functional end to end — catalogs → features → generation → evaluation → aggregation → training (with automatic routing-lambda calibration) → production routing. Every `POST /train` also writes a human-readable report (charts + data) of the freshly trained predictor and its routing calibration — see [Training report](#training-report). An automated test suite is planned for a future release; see [Current status and roadmap](#current-status-and-roadmap).
 
 ## Table of contents
 
@@ -10,6 +10,7 @@
 - [Quick start](#quick-start)
 - [Key concepts](#key-concepts)
 - [End-to-end pipeline](#end-to-end-pipeline)
+- [Training report](#training-report)
 - [Data model](#data-model)
 - [Configuration](#configuration)
 - [Repo structure](#repo-structure)
@@ -56,6 +57,16 @@ And optionally replace the task catalog with your own (custom, official benchmar
 curl -X POST localhost:8000/tasks/import -F file=@data/examples/tasks.jsonl
 ```
 
+Once you have active `features`/`solutions`/`grades` (computed live or loaded via `type=load`, see below), train a predictor and route a prompt with it:
+
+```bash
+curl -X POST localhost:8000/train          # 202, poll GET /jobs for progress
+curl -X POST localhost:8000/route -H "Content-Type: application/json" \
+     -d '{"prompt": "Write a function that reverses a string"}'
+```
+
+`POST /train` also writes a report (charts + data) to `data/current/report/` — see [Training report](#training-report).
+
 ### `data/examples/`
 
 There's one example file per upload the system accepts, and all of them travel as `.jsonl` (one JSON row per line) via `multipart` — `tasks.jsonl`, `questions.json`†, `models.json`†, and `features.jsonl`, `solutions.jsonl`, `validations.jsonl` for `type=load` of `/features/compute`, `/solutions/generate`, and `/solutions/validate` respectively (`type` and the rest of the parameters go as query params, not in the body — see the example `curl` below):
@@ -81,6 +92,7 @@ The `*_exp.json`/`*_exp.jsonl` files (e.g. `tasks_exp.jsonl`, `questions_exp.jso
 - **Logprob-calibrated probability, only where it applies**: LLM features (`kind=binary`/`numeric`) use `exp(logprob)` of the response's first token to get a calibrated probability instead of a plain yes/no. The LLM judge (`services/judge.py`), by contrast, is purely binary (`passed: bool`) — no logprobs, no probability — same as the verdict from `bigcodebench-api`.
 - **Explicit `has_error`**: in `solutions` and `grades`, an infrastructure failure (the LLM call failed, `bigcodebench-api` didn't respond, timeout) is flagged with `has_error=true`, **distinct** from a legitimate negative result (`passed=false`, with its `fail_reason`). Neither one aborts the rest of the batch being processed.
 - **Snapshots on disk**: every reload/recomputation leaves a JSON with the resulting active state at `data/current/<name>.json`, rotating the previous one to `data/previous/<name>.json` (a single step back, not a full history). `./data` is a bind mount (not a named Docker volume), so it's visible/editable directly from the host.
+- **Routing policy = `score = Y_pred − λ · cost/cost_max`**: `Y_pred` is the trained predictor's output, `cost` each candidate's average cost per real attempt. `λ` isn't a parameter the user sets — it's calibrated automatically at training time (`services/routing_calibration.py`) via Monte Carlo simulation (bootstrap-resampling real historical pass/fail outcomes, not synthetic draws) over a lambda grid, picking the "elbow" of the resulting (cost, accuracy) curve with [`kneed`](https://github.com/arvkevi/kneed). `POST /route` always uses the lambda calibrated for the full retry budget (`MAX_SHOTS = 3`) to score every active candidate in one pass, returning them all ranked — not a different lambda per shot, and not an interactive "tell me what you already tried" loop.
 
 ## End-to-end pipeline
 
@@ -89,10 +101,9 @@ flowchart TD
     A["Catalogs<br/>tasks / questions / models"] --> B["features/compute<br/>(LLM or Python script)"]
     A --> C["solutions/generate<br/>(candidate LLM)"]
     C --> D["solutions/validate<br/>(bigcodebench-api or LLM judge)"]
-    B --> E["aggregate<br/>(targets + model_metrics)"]
-    D --> E
-    E --> F["train<br/>(AutoML, PENDING)"]
-    F --> G["route<br/>(production, PENDING)"]
+    B --> F["train<br/>(aggregate + GradientBoostingRegressor + lambda calibration + report)"]
+    D --> F
+    F --> G["route<br/>(production: ranked candidate list)"]
 ```
 
 | Step | Endpoint | Async | Description |
@@ -101,12 +112,25 @@ flowchart TD
 | Features | `POST /features/compute` | Yes | `type=calculate`: for ALL active tasks × questions, questions with `script` → local Python, without `script` → the single active `role=feature` model. `type=load`: inserts features already computed externally. |
 | Generation | `POST /solutions/generate` | Yes | `type=calculate`: generates with ALL active `role=candidate` models, `n_samples` per task. `type=load`: inserts solutions already computed externally. |
 | Evaluation | `POST /solutions/validate` | Yes | Groups active solutions by `task.bcb_task_id`: with a value → `bigcodebench-api` (sequential); without one → the single active `role=judge` model (concurrent). `type=load` also available. |
-| Aggregation | `POST /aggregate` | No | Recomputes `targets` (pass_rate per task+model) and `model_metrics` (aggregated per model) from active solutions/grades. |
-| Training | `POST /train` | No | **Stub** (501) — see roadmap. |
-| Routing | `POST /route` | No | **Stub** (501) — see roadmap. |
+| Training | `POST /train` | Yes | Recomputes `targets`/`model_metrics` from active solutions/grades, builds the dataset from active features/targets, trains `GradientBoostingRegressor` (`GridSearchCV` + `GroupKFold`, grouped by task so a task never leaks across train/test), calibrates the routing lambda for 1..`MAX_SHOTS` attempts (Monte Carlo + automatic elbow detection), persists the predictor (replacing the previous active one), and writes the [training report](#training-report). Progress via `GET /jobs`. There's no standalone aggregation endpoint — this is the only place `targets`/`model_metrics` get recomputed. |
+| Routing | `POST /route` | No | Takes a `prompt`, computes its features live (LLM/script, concurrent), scores every active candidate with the active predictor and the lambda calibrated for the full shot budget, and returns them **all, ranked best first** — the caller executes them in that order until one succeeds. Every decision is recorded in `route_decisions`. 409 if no active predictor exists yet (`POST /train` first). |
 | Jobs | `GET /jobs` | — | Status of the active row for each known async job kind. |
 
 All import/compute/generation/evaluation endpoints are **bulk-only**: there are no "single record" equivalents (e.g. there's no `POST /solutions/{id}/evaluate`) — every process identifies on its own which active rows it needs to process.
+
+## Training report
+
+Every `POST /train` writes a report to `data/current/report/` (rotating the previous one to `data/previous/report/`, same convention as the catalog snapshots) — meant for a human to open directly from disk, no server needed:
+
+| File | What it shows |
+|---|---|
+| `sankey.html` / `.png` | For the production lambda (the one calibrated for the full shot budget), where each test task's attempts actually go — shot 1 → shot 2 → shot 3, stopping as soon as one succeeds (one reproducible Monte Carlo realization, not an aggregate). |
+| `sensitivity_table.html` / `.png` | % of tasks solved and accumulated cost, for a curated set of lambda values × shot budget (1/2/3), on the test split — highlights the best accuracy per column. |
+| `frontier.html` / `.png` | Cost vs. quality at the production shot budget: the router's point against each candidate model used entirely on its own. |
+| `tradeoff_curve.html` / `.png` | The full lambda grid swept on the test split, one curve per shot budget, with a marker (★) at the lambda actually chosen for each — chosen on a *separate* sweep over the train split, so it doesn't have to land exactly on this curve's own peak (see the chart's own caption). |
+| `lambda_grid.html` / `.png` | For a sample of test tasks, which model shot 1 would actually go to as lambda sweeps from 0 to 4 — illustrates the router dropping the most-capable-but-priciest candidate as the cost penalty grows. |
+
+Each chart also has a `.csv` with its underlying data, and `index.html` links all of them. Every chart is built strictly from this project's own data (real solutions/grades + the freshly trained predictor) — nothing is copied from any reference experiment, even where the chart types mirror one for easy side-by-side comparison.
 
 ## Data model
 
@@ -127,8 +151,9 @@ targets + features ──> predictors ──> route_decisions
 - **`questions`**: feature questions, `kind=binary|numeric`; with `script` they're resolved locally in Python (cost 0), without `script` via LLM. `question_key` is their stable key (assigned by the user) to reference them from `features` `type=load`.
 - **`models`**: `role=candidate` (generates/routes solutions, several can be active at once with distinct `name`), `feature` or `judge` (at most one active of each).
 - **`solutions`** / **`grades`**: 1 row per generation attempt / its verdict (1:1 relationship).
-- **`targets`** / **`model_metrics`**: aggregates fully recomputed on every `POST /aggregate`.
-- **`predictors`** / **`route_decisions`**: destination of training and of production routing (not populated yet — see roadmap).
+- **`targets`** / **`model_metrics`**: aggregates fully recomputed at the start of every `POST /train` (no standalone aggregation endpoint).
+- **`predictors`**: one row per `POST /train` run — the serialized model's path (`artifact_path`), the feature-column contract (`feature_columns`), and the calibrated routing lambdas (`routing_lambdas`/`lambda_sweep`). Only one is ever `active` (full replace, same pattern as the rest of the system) — that's always the one `POST /route` uses.
+- **`route_decisions`**: one row per `POST /route` call — the live-computed features, the full ranking returned, and which predictor produced it. Written whether or not the caller ever follows up on the recommendation.
 - **`jobs`**: tracking of async processes (persisted in Postgres, not in memory).
 
 The complete DDL, with the reasoning behind each decision documented inline, is in [`postgres/init/001_schema.sql`](postgres/init/001_schema.sql).
@@ -172,12 +197,12 @@ routerkit/
 │       │   ├── llm_client.py      # litellm + normalize_yes_no/logprobs
 │       │   └── bigcodebench_client.py
 │       ├── routers/                # catalogs, features, solutions,
-│       │   ...                     # evaluation, aggregation, training,
-│       │   ...                     # routing, jobs
+│       │   ...                     # evaluation, training, routing, jobs
 │       └── services/
 │           ├── cascade.py          # cascading logical deletion
 │           ├── concurrency.py      # run_bounded (ThreadPoolExecutor)
 │           ├── jobs.py             # async jobs persisted in Postgres
+│           ├── jsonl.py            # shared type=load parsing
 │           ├── snapshots.py        # data/current + data/previous
 │           ├── seed.py             # preloads tasks_exp.jsonl at startup
 │           ├── tasks_catalog.py    # task replacement (import + seed)
@@ -185,20 +210,23 @@ routerkit/
 │           ├── generation.py       # solution generation
 │           ├── judge.py            # LLM judge (custom tasks)
 │           ├── aggregation.py      # targets + model_metrics
-│           └── training.py         # STUB
+│           ├── training.py         # dataset build + GridSearchCV training
+│           ├── routing_calibration.py  # Monte Carlo lambda calibration
+│           ├── policy.py           # score_and_select (production scoring)
+│           └── reports.py          # training report (charts + CSVs)
 └── data/
     ├── examples/                   # one minimal example per upload, plus
     │                                # the real *_exp.json(l) experiment data
-    ├── current/                    # current snapshots (runtime, gitignored)
-    └── previous/                   # previous snapshot (runtime, gitignored)
+    ├── predictors/                 # trained .joblib artifacts (runtime, gitignored)
+    ├── current/                    # current snapshots + training report (runtime, gitignored)
+    └── previous/                   # previous snapshot + report (runtime, gitignored)
 ```
 
 ## Current status and roadmap
 
-**Complete and functional**: catalogs (with automatic preloading of the official benchmark), features (LLM + Python), solution generation, evaluation (bigcodebench-api + LLM judge), targets/model_metrics aggregation, async jobs.
+**Complete and functional, end to end**: catalogs (with automatic preloading of the official benchmark), features (LLM + Python), solution generation, evaluation (bigcodebench-api + LLM judge), targets/model_metrics aggregation, async jobs, predictor training with automatic routing-lambda calibration, the training report, and production routing (`POST /route`).
 
-**Pending** (what's next):
+**Deliberately out of scope for this release** (not gaps found during testing — decisions made to keep this release focused):
 
-- **Predictor training** (`services/training.py`, `POST /train`): build the long-format dataset from active `features`/`targets`, choose/run AutoML, serialize the artifact under `ARTIFACTS_DIR`, and register the `predictor` in Postgres.
-- **Production routing policy** (`services/routing.py` — doesn't exist yet, today it lives as a stub inside `routers/routing.py`, `POST /route`): compute live features for a new prompt, score each candidate with the production predictor, and pick a winner balancing quality vs. cost (λ, `p_min`, exclusions, fallback — parameters not defined yet).
-- **Result export**: there's no format/endpoint defined yet to export the training dataset or routing results out of the system.
+- **Automated test suite**: the system was validated through extensive manual/live testing against this project's own real dataset (see the [training report](#training-report)), not an automated regression suite — planned for a future release.
+- **Result export**: there's no dedicated endpoint to export the training dataset or routing history as a file — `route_decisions` (every `POST /route` call) and the training report's CSVs already cover most of what that would do; a standalone export format can be added if a concrete need for one comes up.

@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 
 from app.db.base import get_db
 from app.db.models import Predictor
+from app.schemas import JobBoardEntry
 from app.services import jobs, training
 from app.services.jobs import JobConflictError, ProgressFn
 
@@ -46,12 +47,13 @@ def _train_job(db: Session, progress: ProgressFn) -> dict:
     }
 
 
-@router.post("/train", status_code=202)
+@router.post("/train", status_code=202, response_model=JobBoardEntry)
 def train(db: Session = Depends(get_db)) -> dict:
     """Launches (async) training of a new predictor: recomputes
-    targets/model_metrics from the currently active solutions/grades (same
-    as POST /aggregate, done here automatically — no separate step
-    needed), builds the dataset from active features/targets and trains,
+    targets/model_metrics from the currently active solutions/grades (no
+    separate step needed — there's no standalone aggregation endpoint,
+    this is the only place that recomputation happens), builds the dataset
+    from active features/targets and trains,
     then calibrates the routing lambda (services.routing_calibration) for
     the resulting model and generates a training report (services.reports —
     charts + data under `{ARTIFACTS_DIR}/current/report/`, same

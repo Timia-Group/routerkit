@@ -8,6 +8,7 @@ from app.clients import bigcodebench_client
 from app.clients.bigcodebench_client import BigCodeBenchError
 from app.db.base import get_db
 from app.db.models import Grade, Model, Solution, Task
+from app.schemas import JobBoardEntry
 from app.services import jobs, judge
 from app.services.concurrency import run_bounded
 from app.services.jobs import JobConflictError, ProgressFn
@@ -352,7 +353,7 @@ def _calculate_grades_job(db: Session, progress: ProgressFn) -> dict:
     return {"graded": graded, "failed": failed, "errors": errors}
 
 
-@router.post("/solutions/validate", status_code=202)
+@router.post("/solutions/validate", status_code=202, response_model=JobBoardEntry)
 async def validate_solutions(
     type: Literal["load", "calculate"] = "calculate",  # noqa: A002 - domain name
     file: UploadFile | None = File(

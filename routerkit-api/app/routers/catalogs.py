@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 
 from app.db.base import get_db
 from app.db.models import Model, Question
-from app.schemas import ModelImportRow, QuestionImportRow
+from app.schemas import CatalogReplaceResult, ModelImportRow, QuestionImportRow
 from app.services import cascade
 from app.services.snapshots import row_to_dict, write_snapshot
 from app.services.tasks_catalog import parse_tasks_jsonl, replace_tasks
@@ -50,6 +50,7 @@ def _parse_json_object(raw: str) -> dict | list:
 @router.post(
     "/tasks/import",
     summary="Replaces ALL active tasks from a tasks.jsonl file provided by the user",
+    response_model=CatalogReplaceResult,
 )
 async def import_tasks(
     file: UploadFile = File(description="tasks.jsonl: one JSON task per line."),
@@ -92,6 +93,7 @@ async def import_tasks(
 @router.post(
     "/questions/import",
     summary="Replaces the features question catalog from questions.json",
+    response_model=CatalogReplaceResult,
 )
 async def import_questions(
     file: UploadFile = File(description="questions.json: list of questions."),
@@ -180,6 +182,7 @@ async def import_questions(
 @router.post(
     "/models/import",
     summary="Replaces the candidate/judge model catalog from models.json",
+    response_model=CatalogReplaceResult,
 )
 async def import_models(
     file: UploadFile = File(description="models.json: list of models."),

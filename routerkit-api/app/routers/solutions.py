@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.db.base import get_db
 from app.db.models import Grade, Model, Solution, Task
+from app.schemas import JobBoardEntry
 from app.services import generation, jobs
 from app.services.concurrency import run_bounded
 from app.services.jobs import JobConflictError, ProgressFn
@@ -253,7 +254,7 @@ def _calculate_solutions_job(db: Session, progress: ProgressFn, n_samples: int) 
     return {"created": created, "failed": failed, "errors": errors}
 
 
-@router.post("/solutions/generate", status_code=202)
+@router.post("/solutions/generate", status_code=202, response_model=JobBoardEntry)
 async def generate_solutions(
     type: Literal["load", "calculate"] = "calculate",  # noqa: A002 - domain name
     n_samples: int = Query(

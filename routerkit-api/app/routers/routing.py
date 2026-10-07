@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.db.base import get_db
 from app.db.models import Model, Predictor, Question, RouteDecision
+from app.schemas import RouteResponse
 from app.services import features_llm, policy
 from app.services.concurrency import run_bounded
 from app.services.features_python import compute_python_feature
@@ -58,7 +59,7 @@ def _compute_live_feature(task: _AdHocTask, question: Question, feature_model: M
     return features_llm.compute_llm_feature(task, question, feature_model)
 
 
-@router.post("/route")
+@router.post("/route", response_model=RouteResponse)
 def route(body: RouteRequest, db: Session = Depends(get_db)) -> dict:
     """Routes a task (`body.prompt`) to the candidate LLMs, using the
     active predictor (POST /train) and the routing policy

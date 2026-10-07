@@ -2,12 +2,13 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from app.db.base import get_db
+from app.schemas import JobBoardEntry
 from app.services.jobs import status_board
 
 router = APIRouter(tags=["jobs"])
 
 
-@router.get("/jobs")
+@router.get("/jobs", response_model=list[JobBoardEntry])
 def list_jobs(db: Session = Depends(get_db)) -> list[dict]:
     """State of the ACTIVE row for EACH known kind, in a single request.
 

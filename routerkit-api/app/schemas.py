@@ -1,14 +1,24 @@
-"""Pydantic models used to document (Swagger) and validate the content of
-the import files (tasks.jsonl, questions.json, models.json). All input to
-routerkit-api is JSON (standardized).
+"""Pydantic models used to document (Swagger) and validate both requests
+and responses across routerkit-api. All input/output is JSON (standardized).
 
-The import endpoints receive a file (multipart), so FastAPI can't show the
-shape of each row in the request body automatically; these models are used
-to validate each already-parsed row and are documented in each endpoint's
-docstring with an example.
+Request side (`*ImportRow`): the import endpoints receive a file
+(multipart), so FastAPI can't show the shape of each row in the request
+body automatically; these models validate each already-parsed row and are
+documented in each endpoint's docstring with an example.
+
+Response side (the rest of this file): every endpoint declares a real
+`response_model` instead of a bare `dict` — an unparameterized `dict`
+return type has no field names for FastAPI to describe, so Swagger falls
+back to a generic "additionalProp1" placeholder example, which isn't
+useful to anyone reading the docs. The response_model doesn't change what
+each endpoint actually returns (still a plain dict internally) — FastAPI
+validates/serializes it against the model, which is also a second line of
+defense: a field silently renamed or dropped in the implementation would
+fail response validation instead of silently changing the public API.
 """
 
-from typing import Literal
+from datetime import datetime
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -144,3 +154,80 @@ class ModelImportRow(BaseModel):
     # solutions of custom tasks. There can only be ONE active model with
     # role='feature' and ONE active model with role='judge' at a time.
     role: Literal["candidate", "feature", "judge"]
+
+
+class CatalogReplaceResult(BaseModel):
+    """Response of a catalog import endpoint (tasks/questions/models import
+    all share this exact shape)."""
+
+    model_config = ConfigDict(json_schema_extra={"example": {"deactivated_previous": 11, "created": 1135}})
+
+    deactivated_previous: int
+    created: int
+
+
+class JobBoardEntry(BaseModel):
+    """Status of one async job kind's active row. This is both what each
+    async POST endpoint (`features/compute`, `solutions/generate`,
+    `solutions/validate`, `train`) returns right away (202, before the job
+    has necessarily finished), and the shape of each entry `GET /jobs`
+    returns one of per known kind.
+
+    `last_result` is intentionally loose (`dict[str, Any]`, not a specific
+    model): its shape depends on which `kind` produced it (training's
+    result looks nothing like a features-compute result) — each kind's own
+    endpoint docstring documents what its `last_result` contains."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "kind": "train_predictor",
+                "status": "idle",
+                "message": "done",
+                "started_at": "2026-10-07T20:53:05.025345Z",
+                "finished_at": "2026-10-07T21:03:21.568169Z",
+                "last_result": {"predictor_id": 12, "test_r2": 0.189, "artifact_path": "/data/artifacts/predictors/predictor_1791406996.joblib"},
+            }
+        }
+    )
+
+    kind: str
+    status: Literal["empty", "running", "idle"]
+    message: str | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    last_result: dict[str, Any] | None = None
+
+
+class RankingEntry(BaseModel):
+    """One scored candidate in a `POST /route` response — the full list is
+    already sorted best (`score` highest) first."""
+
+    model_id: int
+    model_name: str
+    p: float
+    price: float
+    score: float
+
+
+class RouteResponse(BaseModel):
+    """Response of `POST /route`."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "decision_id": 42,
+                "lambda_used": 0.45454545454545453,
+                "ranking": [
+                    {"model_id": 33, "model_name": "Grok 4.6", "p": 0.91, "price": 0.0026, "score": 0.8987},
+                    {"model_id": 31, "model_name": "Claude Sonnet 5", "p": 0.95, "price": 0.0096, "score": 0.8903},
+                ],
+                "features_cost_usd": 0.0412,
+            }
+        }
+    )
+
+    decision_id: int
+    lambda_used: float
+    ranking: list[RankingEntry]
+    features_cost_usd: float

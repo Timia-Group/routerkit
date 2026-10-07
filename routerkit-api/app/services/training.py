@@ -140,7 +140,10 @@ def _build_dataset(db: Session) -> tuple[pd.DataFrame, pd.Series, pd.Series, pd.
         .all()
     )
     if not targets:
-        raise TrainingError("no active targets to train on (did you run POST /aggregate?)")
+        raise TrainingError(
+            "no active targets to train on — recompute_targets found nothing, which means "
+            "there are no active grades yet (generate and evaluate solutions first)"
+        )
 
     targets_df = pd.DataFrame(
         [
@@ -189,12 +192,12 @@ def train_predictor(db: Session, progress: ProgressFn | None = None) -> Training
     the routing lambda (services.routing_calibration) for it. Raises
     TrainingError if there isn't enough active data (see _build_dataset).
 
-    One entry point end to end on purpose: the caller (POST /train) never
-    has to remember to call POST /aggregate first, or to calibrate routing
-    as a separate step before the predictor is actually usable by
-    POST /route. `progress` (optional) is called at the 4 phases (data
-    prep, training, routing calibration, report generation) for GET /jobs
-    to report.
+    One entry point end to end on purpose: there's no standalone
+    aggregation endpoint, and the caller (POST /train) never has to
+    calibrate routing as a separate step before the predictor is actually
+    usable by POST /route. `progress` (optional) is called at the 4 phases
+    (data prep, training, routing calibration, report generation) for
+    GET /jobs to report.
     """
     if progress:
         progress(1, 4, "preparing data")

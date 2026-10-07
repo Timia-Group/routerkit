@@ -1,10 +1,11 @@
 from contextlib import asynccontextmanager
+from typing import Literal
 
 from fastapi import FastAPI
+from pydantic import BaseModel
 
 from app.db.base import SessionLocal
 from app.routers import (
-    aggregation,
     catalogs,
     evaluation,
     features,
@@ -47,7 +48,6 @@ OPENAPI_TAGS = [
             "benchmark one, LLM judge if it's custom."
         ),
     },
-    {"name": "aggregation", "description": "Recomputes targets and model_metrics from the active solutions/grades."},
     {"name": "features", "description": "(Async) computation of LLM/programmatic features over active tasks/questions."},
     {
         "name": "training",
@@ -67,7 +67,7 @@ app = FastAPI(
     title="routerkit-api",
     description=(
         "RouterKit orchestrator: catalogs, features, solution generation, "
-        "evaluation (bigcodebench-api or LLM judge), aggregation, and training of the "
+        "evaluation (bigcodebench-api or LLM judge), training, and production routing of the "
         "LLM router. No 'experiment' concept: everything operates on what's active."
     ),
     version="0.1.0",
@@ -78,13 +78,16 @@ app = FastAPI(
 app.include_router(catalogs.router)
 app.include_router(solutions.router)
 app.include_router(evaluation.router)
-app.include_router(aggregation.router)
 app.include_router(features.router)
 app.include_router(training.router)
 app.include_router(routing.router)
 app.include_router(jobs.router)
 
 
-@app.get("/healthz")
+class HealthResponse(BaseModel):
+    status: Literal["ok"]
+
+
+@app.get("/healthz", response_model=HealthResponse)
 def healthz() -> dict:
     return {"status": "ok"}

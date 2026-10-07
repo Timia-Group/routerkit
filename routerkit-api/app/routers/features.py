@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.db.base import get_db
 from app.db.models import Feature, Model, Question, Task
+from app.schemas import JobBoardEntry
 from app.services import features_llm, jobs
 from app.services.concurrency import run_bounded
 from app.services.features_python import ScriptError, compute_python_feature
@@ -241,7 +242,7 @@ def _calculate_features_job(db: Session, progress: ProgressFn) -> dict:
     return {"computed": computed, "errors": errors}
 
 
-@router.post("/features/compute", status_code=202)
+@router.post("/features/compute", status_code=202, response_model=JobBoardEntry)
 async def compute_features(
     type: Literal["load", "calculate"] = "calculate",  # noqa: A002 - domain name
     file: UploadFile | None = File(
