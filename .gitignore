@@ -24,9 +24,15 @@ __pycache__/
 /data/examples/solutions_exp.jsonl.gz
 /data/examples/validations_exp.jsonl.gz
 
-# Scratch file for the user's own tests (real test credentials/endpoints)
-# — never committed, deleted once testing is done.
-/data/examples/models_exp2.json
+# Scratch files for the user's own tests (real test credentials/endpoints)
+# — never committed, deleted once testing is done. models_test_small: a
+# couple candidates, for quick/cheap calculate-mode smoke tests.
+# models_test_full: the real experiment's full 8-model catalog with real
+# endpoints where we have them (the Spheron-hosted candidates keep their
+# placeholder — never actually called, see conversation/README on
+# POST /route never calling candidates itself).
+/data/examples/models_test_small.json
+/data/examples/models_test_full.json
 
 # Trained predictor artifacts (.joblib) — regenerable via POST /train,
 # same reasoning as solutions_exp/validations_exp above.

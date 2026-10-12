@@ -68,6 +68,17 @@ curl -X POST localhost:8000/route -H "Content-Type: application/json" \
 
 `POST /train` also writes a report (charts + data) to `data/current/report/` — see [Training report](#training-report).
 
+### Easiest path: `scripts/`
+
+The above is the manual, step-by-step version. For the common case — stand everything up and reproduce the real experiment, with zero LLM cost — two Python scripts (stdlib only, no `pip install` needed) do it in two commands:
+
+```bash
+python scripts/start.py          # downloads the heavy datasets if missing, brings up docker-compose, waits for the API
+python scripts/run_pipeline.py   # loads the real experiment's catalogs/data (type=load) and trains a predictor
+```
+
+`run_pipeline.py` stops at the **first** error of any kind, anywhere (even a single failed row in an otherwise-successful batch) — it's meant to surface every problem for you to look at, not decide on its own what's safe to ignore. Once you've fixed whatever it reported, resume without repeating earlier steps with `--start-from=<step>` (e.g. `--start-from=solutions`). To use your own catalogs/data instead of the experiment's, or to actually call LLMs instead of loading precomputed results, see `python scripts/run_pipeline.py --help` — every option is documented there, not duplicated here.
+
 ### `data/examples/`
 
 There's one example file per upload the system accepts, and all of them travel as `.jsonl` (one JSON row per line) via `multipart` — `tasks.jsonl`, `questions.json`†, `models.json`†, and `features.jsonl`, `solutions.jsonl`, `validations.jsonl` for `type=load` of `/features/compute`, `/solutions/generate`, and `/solutions/validate` respectively (`type` and the rest of the parameters go as query params, not in the body — see the example `curl` below):
@@ -96,6 +107,7 @@ Two of those (`solutions_exp.jsonl`, `validations_exp.jsonl`) are hundreds of MB
 - **Explicit `has_error`**: in `solutions` and `grades`, an infrastructure failure (the LLM call failed, `bigcodebench-api` didn't respond, timeout) is flagged with `has_error=true`, **distinct** from a legitimate negative result (`passed=false`, with its `fail_reason`). Neither one aborts the rest of the batch being processed.
 - **Snapshots on disk**: every reload/recomputation leaves a JSON with the resulting active state at `data/current/<name>.json`, rotating the previous one to `data/previous/<name>.json` (a single step back, not a full history). `./data` is a bind mount (not a named Docker volume), so it's visible/editable directly from the host.
 - **Routing policy = `score = Y_pred − λ · cost/cost_max`**: `Y_pred` is the trained predictor's output, `cost` each candidate's average cost per real attempt. `λ` isn't a parameter the user sets — it's calibrated automatically at training time (`services/routing_calibration.py`) via Monte Carlo simulation (bootstrap-resampling real historical pass/fail outcomes, not synthetic draws) over a lambda grid, picking the "elbow" of the resulting (cost, accuracy) curve with [`kneed`](https://github.com/arvkevi/kneed). `POST /route` always uses the lambda calibrated for the full retry budget (`MAX_SHOTS = 3`) to score every active candidate in one pass, returning them all ranked — not a different lambda per shot, and not an interactive "tell me what you already tried" loop.
+- **LLM calls retry, then circuit-break, per model**: a rate-limit or connection error is retried automatically (up to 3 times, exponential backoff) before counting as a real failure (see [`app/clients/llm_client.py`](routerkit-api/app/clients/llm_client.py)). If the *same* model still fails 3 times in a row even after retries, it's assumed to be down for now — the rest of that model's not-yet-started work in the current batch is skipped (not attempted) instead of each item waiting out the same retries to confirm it again (see `circuit_breaker` in [`app/services/concurrency.py`](routerkit-api/app/services/concurrency.py)). Scoped per model: another model having an outage never affects this one.
 
 ## End-to-end pipeline
 
@@ -179,6 +191,9 @@ Environment variables (`.env`, see [`.env.example`](.env.example)):
 routerkit/
 ├── docker-compose.yml
 ├── .env.example
+├── scripts/
+│   ├── start.py                   # downloads datasets, docker compose up, waits for the API
+│   └── run_pipeline.py            # runs the full pipeline end to end (see Quick start)
 ├── postgres/
 │   └── init/001_schema.sql        # full, commented DDL
 ├── bigcodebench-api/
