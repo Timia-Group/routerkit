@@ -41,12 +41,24 @@ duplicated.
 
 import os
 import re
+import time
 import unicodedata
 from dataclasses import dataclass
 
 import litellm
 
 from app.db.models import Model
+
+# Retried automatically (see _call_with_retries): both are transient,
+# retrying the identical request later has a real chance of succeeding.
+# litellm.Timeout is itself a subclass of APIConnectionError, so it's
+# already covered. Deliberately NOT retried: litellm.ContextWindowExceededError
+# (the prompt is too large for the model — the exact same request will
+# fail the exact same way every time; retrying doesn't help, the prompt
+# itself would have to change) and anything else (auth errors, bad
+# requests, etc. — also not transient).
+_RETRYABLE_EXCEPTIONS = (litellm.RateLimitError, litellm.APIConnectionError)
+_MAX_RETRIES = 3
 
 # Accepted variants of a yes/no response, already normalized (uppercase,
 # no accents): English and Spanish. "SI"/"SÍ" count as YES.
@@ -219,6 +231,30 @@ def cost_usd(
     return (prompt_tokens / 1_000_000) * in_price + (completion_tokens / 1_000_000) * out_price
 
 
+def _call_with_retries(fn, *, model: Model):
+    """Calls `fn()` (a zero-arg closure wrapping the actual litellm call),
+    retrying up to `_MAX_RETRIES` times with exponential backoff (1s, 2s,
+    4s between attempts — up to `_MAX_RETRIES` attempts beyond the first,
+    so up to `_MAX_RETRIES + 1` total) if it raises a `_RETRYABLE_EXCEPTIONS`
+    error. Any other exception (including a retryable one once retries are
+    exhausted) is wrapped in `LlmClientError`, same as before this existed —
+    callers don't need to know retries happened at all."""
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            return fn()
+        except _RETRYABLE_EXCEPTIONS as exc:
+            last_exc = exc
+            if attempt == _MAX_RETRIES:
+                break
+            time.sleep(2**attempt)  # 1s, 2s, 4s
+        except Exception as exc:  # noqa: BLE001 - normalized into LlmClientError for the caller
+            raise LlmClientError(f"model {model.model_id} ({model.name}): {exc}") from exc
+    raise LlmClientError(
+        f"model {model.model_id} ({model.name}): failed after {_MAX_RETRIES} retries: {last_exc}"
+    ) from last_exc
+
+
 def _common_kwargs(model: Model) -> dict:
     kwargs: dict = {"model": _litellm_model_name(model), "timeout": model.timeout_seconds}
     api_key = _resolve_api_key(model)
@@ -250,7 +286,10 @@ def complete(
     `logprobs`/`top_logprobs` only have an effect on providers that support
     them (e.g. OpenAI); not all do (e.g. Anthropic). `temperature` is a
     one-off override — if omitted, `model.temperature` is used.
-    Raises LlmClientError if the api key is missing or if litellm's call fails.
+    Raises LlmClientError if the api key is missing or if litellm's call
+    fails — a rate-limit or connection error is retried automatically first
+    (see _call_with_retries), so this only raises once those retries are
+    exhausted too (or immediately for any other kind of failure).
 
     `model.api_kind` decides the actual mechanism: `chat_completions`
     (default, `litellm.completion()`) or `responses` (`litellm.responses()`,
@@ -280,10 +319,7 @@ def _complete_chat_completions(
         if top_logprobs is not None:
             kwargs["top_logprobs"] = top_logprobs
 
-    try:
-        response = litellm.completion(**kwargs)
-    except Exception as exc:  # noqa: BLE001 - normalized into LlmClientError for the caller
-        raise LlmClientError(f"model {model.model_id} ({model.name}): {exc}") from exc
+    response = _call_with_retries(lambda: litellm.completion(**kwargs), model=model)
 
     choice = response.choices[0]
     logprobs_payload = None
@@ -325,10 +361,7 @@ def _complete_responses(
         kwargs["top_logprobs"] = top_logprobs if top_logprobs is not None else 1
         kwargs["include"] = ["message.output_text.logprobs"]
 
-    try:
-        response = litellm.responses(**kwargs)
-    except Exception as exc:  # noqa: BLE001 - normalized into LlmClientError for the caller
-        raise LlmClientError(f"model {model.model_id} ({model.name}): {exc}") from exc
+    response = _call_with_retries(lambda: litellm.responses(**kwargs), model=model)
 
     text = getattr(response, "output_text", None)
     if not text:

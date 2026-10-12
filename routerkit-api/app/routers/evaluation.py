@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.clients import bigcodebench_client
 from app.clients.bigcodebench_client import BigCodeBenchError
+from app.clients.llm_client import LlmClientError
 from app.db.base import get_db
 from app.db.models import Grade, Model, Solution, Task
 from app.schemas import JobBoardEntry
@@ -24,6 +25,11 @@ from app.services.tasks_catalog import (
 router = APIRouter(tags=["evaluation"])
 
 _KIND = "solutions_validate"
+# Same reasoning/scope as routers/solutions.py's own constant: after this
+# many consecutive LlmClientError's from the judge model (not JudgeError —
+# that's the judge responding with something unparseable, not a sign the
+# service is unreachable), remaining not-yet-started gradings are skipped.
+_CIRCUIT_BREAKER_THRESHOLD = 3
 
 
 def _deactivate_active_grade(db: Session, *, solution_id: int) -> None:
@@ -320,6 +326,7 @@ def _calculate_grades_job(db: Session, progress: ProgressFn) -> dict:
             custom,
             lambda pair: judge.grade_with_llm_judge(pair[0], pair[1], judge_model),
             judge_model.concurrency,
+            circuit_breaker=(LlmClientError, _CIRCUIT_BREAKER_THRESHOLD),
         )
         for (task, solution), result, exc in judge_results:
             if exc is not None:

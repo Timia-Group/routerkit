@@ -210,6 +210,17 @@ CREATE TABLE routerkit.features (
     latency_ms          NUMERIC(18, 3),
     cost_usd            NUMERIC(18, 8),
 
+    -- Error message if the computation failed (script exception, LLM call
+    -- failure, or no active model with role='feature'). Same convention as
+    -- solutions.gen_error.
+    gen_error           TEXT,
+
+    -- Explicit flag instead of relying on gen_error IS NOT NULL — cheaper
+    -- filter than null-checks on gen_error, and also useful for loaded
+    -- rows (type=load) that don't necessarily carry a text gen_error.
+    -- Same convention as solutions.has_error.
+    has_error           BOOLEAN NOT NULL DEFAULT FALSE,
+
     -- Logical delete: recomputing features deactivates the previous active
     -- row for the same (task_id, question_id) and creates a new one. There
     -- can only be one active row per (task_id, question_id) at a time

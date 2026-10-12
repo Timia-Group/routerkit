@@ -113,6 +113,8 @@ class Feature(Base):
     output_tokens: Mapped[int | None] = mapped_column(Integer)
     latency_ms: Mapped[Decimal | None] = mapped_column(Numeric(18, 3))
     cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    gen_error: Mapped[str | None] = mapped_column(Text)
+    has_error: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # Soft delete: at most one active row per (task_id, question_id)
     # (see idx_features_natural_key_active). Deactivated in cascade when
     # its task or its question is deactivated (services/cascade.py).

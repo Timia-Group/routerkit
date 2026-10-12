@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy import insert, text, update
 from sqlalchemy.orm import Session
 
+from app.clients.llm_client import LlmClientError
 from app.db.base import get_db
 from app.db.models import Grade, Model, Solution, Task
 from app.schemas import JobBoardEntry
@@ -22,6 +23,14 @@ from app.services.tasks_catalog import (
 router = APIRouter(tags=["solutions"])
 
 _KIND = "solutions_generate"
+# After this many consecutive LlmClientError's for the SAME candidate model
+# (each already past its own internal retries in llm_client), that model is
+# assumed to be down for now — remaining not-yet-started (task, sample_idx)
+# items for it are skipped rather than each independently waiting out the
+# same retries to confirm it again (see services.concurrency.run_bounded's
+# circuit_breaker — scoped per model, since this loop calls run_bounded
+# once per candidate).
+_CIRCUIT_BREAKER_THRESHOLD = 3
 
 # There's no POST /solutions (manual single-row creation): seeding test
 # solutions without going through generation.py is already covered by
@@ -215,11 +224,14 @@ def _calculate_solutions_job(db: Session, progress: ProgressFn, n_samples: int) 
         name = model.name
         items = [(task, sample_idx) for task in tasks for sample_idx in range(n_samples)]
         results = run_bounded(
-            items, lambda item: generation.generate_solution(item[0], model), model.concurrency
+            items,
+            lambda item: generation.generate_solution(item[0], model),
+            model.concurrency,
+            circuit_breaker=(LlmClientError, _CIRCUIT_BREAKER_THRESHOLD),
         )
 
         for (task, sample_idx), result, exc in results:
-            gen_error = str(exc) if exc is not None else result.gen_error
+            gen_error = str(exc) if exc is not None else None
 
             db.add(
                 Solution(

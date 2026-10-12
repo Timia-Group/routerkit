@@ -8,19 +8,37 @@ deactivation "forward" through the pipeline:
 
     tasks ─┬─> features
            ├─> solutions ─> grades
-           └─> targets
+           ├─> targets
+           └─> predictor (active one, if any)
 
     questions ─> features
+              └─> predictor (active one, if any)
 
     models ─┬─> solutions ─> grades
             ├─> targets
-            └─> model_metrics
+            ├─> model_metrics
+            └─> predictor (active one, if any)
+
+The active predictor is deactivated unconditionally (not matched by id —
+it doesn't reference any specific task/question/model row, just whatever
+was active in each table at train time) whenever any of the three reloads:
+its `targets` just got deactivated too (tasks/models) or its
+`feature_columns["questions"]` may no longer match the active catalog
+(questions) — in both cases, leaving it `active=true` would let POST
+/route keep silently serving predictions trained on a catalog that's no
+longer the one loaded, with no signal to the caller that happened. Forces
+an explicit POST /train before routing again, same as if there had never
+been one.
 """
 
 from sqlalchemy import ColumnElement, select, update
 from sqlalchemy.orm import Session
 
-from app.db.models import Feature, Grade, ModelMetric, Solution, Target
+from app.db.models import Feature, Grade, ModelMetric, Predictor, Solution, Target
+
+
+def _deactivate_active_predictor(db: Session) -> None:
+    db.execute(update(Predictor).where(Predictor.active.is_(True)).values(active=False))
 
 
 def _deactivate_solutions_where(db: Session, condition: ColumnElement[bool]) -> None:
@@ -42,25 +60,31 @@ def _deactivate_solutions_where(db: Session, condition: ColumnElement[bool]) -> 
 
 
 def deactivate_for_tasks(db: Session, task_ids: list[int]) -> None:
-    """Deactivates features/solutions(+grades)/targets of the given tasks."""
+    """Deactivates features/solutions(+grades)/targets of the given tasks,
+    and the active predictor (its targets just went away too)."""
     if not task_ids:
         return
     db.execute(update(Feature).where(Feature.task_id.in_(task_ids)).values(active=False))
     _deactivate_solutions_where(db, Solution.task_id.in_(task_ids))
     db.execute(update(Target).where(Target.task_id.in_(task_ids)).values(active=False))
+    _deactivate_active_predictor(db)
 
 
 def deactivate_for_questions(db: Session, question_ids: list[int]) -> None:
-    """Deactivates features of the given questions."""
+    """Deactivates features of the given questions, and the active
+    predictor (its feature_columns may no longer match the active catalog)."""
     if not question_ids:
         return
     db.execute(update(Feature).where(Feature.question_id.in_(question_ids)).values(active=False))
+    _deactivate_active_predictor(db)
 
 
 def deactivate_for_models(db: Session, model_ids: list[int]) -> None:
-    """Deactivates solutions(+grades)/targets/model_metrics of the given models."""
+    """Deactivates solutions(+grades)/targets/model_metrics of the given
+    models, and the active predictor (its targets just went away too)."""
     if not model_ids:
         return
     _deactivate_solutions_where(db, Solution.model_id.in_(model_ids))
     db.execute(update(Target).where(Target.model_id.in_(model_ids)).values(active=False))
     db.execute(update(ModelMetric).where(ModelMetric.model_id.in_(model_ids)).values(active=False))
+    _deactivate_active_predictor(db)

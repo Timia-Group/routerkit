@@ -9,17 +9,19 @@ cleaning up markdown code blocks or anything else) — the resulting code is
 not processed or validated (syntax, function name, fences, etc.); that's
 the responsibility of the evaluation stage, not this one.
 
-A failure of the LLM call (`LlmClientError`) is not propagated: it's caught
-here and returned as `GenerationResult(code=None, gen_error=...)`, so the
-caller can still insert a row (a record that this particular generation
-failed) without aborting the rest of the batch.
+A failure of the LLM call (`LlmClientError`) propagates — same convention
+as services.features_llm/services.judge: the caller (routers/solutions.py)
+catches it and still inserts a row (`has_error=true`, `gen_error` with the
+message) without aborting the rest of the batch. Letting it propagate
+(rather than catching it here and returning it as a field) is also what
+lets services.concurrency.run_bounded's circuit breaker see these failures
+at all — it only reacts to raised exceptions.
 """
 
 import time
 from dataclasses import dataclass
 
 from app.clients import llm_client
-from app.clients.llm_client import LlmClientError
 from app.db.models import Model, Task
 
 _PROMPT_TEMPLATE = (
@@ -30,36 +32,24 @@ _PROMPT_TEMPLATE = (
 
 @dataclass
 class GenerationResult:
-    code: str | None
-    tokens_in: int | None
-    tokens_out: int | None
+    code: str
+    tokens_in: int
+    tokens_out: int
     latency_ms: float
     cost_usd: float
-    gen_error: str | None
 
 
 def generate_solution(task: Task, model: Model) -> GenerationResult:
     """Generates a candidate solution for `task` using `model`.
 
     `model.temperature` (if defined) is resolved by app.clients.llm_client
-    alone; no temperature is passed per request. Never raises: if the LLM
-    call fails, returns a GenerationResult with `code=None` and `gen_error` set.
+    alone; no temperature is passed per request. Raises LlmClientError if
+    the call fails.
     """
     started = time.perf_counter()
-    try:
-        response = llm_client.complete(
-            model, [{"role": "user", "content": _PROMPT_TEMPLATE.format(task_prompt=task.prompt)}]
-        )
-    except LlmClientError as exc:
-        return GenerationResult(
-            code=None,
-            tokens_in=None,
-            tokens_out=None,
-            latency_ms=(time.perf_counter() - started) * 1000,
-            cost_usd=0.0,
-            gen_error=str(exc),
-        )
-
+    response = llm_client.complete(
+        model, [{"role": "user", "content": _PROMPT_TEMPLATE.format(task_prompt=task.prompt)}]
+    )
     latency_ms = (time.perf_counter() - started) * 1000
     return GenerationResult(
         code=response.text,
@@ -69,5 +59,4 @@ def generate_solution(task: Task, model: Model) -> GenerationResult:
         cost_usd=llm_client.cost_usd(
             model, response.prompt_tokens, response.completion_tokens, latency_ms=latency_ms
         ),
-        gen_error=None,
     )

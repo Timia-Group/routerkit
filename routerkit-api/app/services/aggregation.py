@@ -3,8 +3,29 @@
 Formulas based on the schema comments (routerkit.targets,
 routerkit.model_metrics):
 
-- targets: n = generated solutions, k = solutions with grades.passed=True,
-  pass_rate = k/n. One row per (task, candidate model).
+- targets: n = generated solutions EXCLUDING `has_error=true` ones BY
+  DEFAULT (a connection drop, exhausted rate-limit/timeout retries, a
+  missing api key, a content-filter block, or any other call failure
+  means no response ever came back, so it says nothing about whether the
+  model can solve the task — same exclusion services.routing_calibration
+  already applies to its own outcome pool). The one deliberate carve-out
+  is `_TRUNCATION_GEN_ERROR_PATTERN`: a `has_error=true` row whose
+  `gen_error` says the response was merely truncated
+  (`finish_reason=length`/`max_tokens`) IS counted in `n` — the model did
+  answer, it just ran out of its configured output budget, which is a
+  real attempt that can legitimately fail evaluation, not a call failure.
+  This carve-out only ever matches the historical experiment dataset
+  (`solutions_exp.jsonl`, produced by an external process that flagged
+  truncated-but-received responses as `has_error=true` too); the live
+  generation path (services.generation) never sets `has_error=true` for
+  that reason at all — it doesn't inspect `finish_reason` — so for any
+  future type=calculate run or freshly loaded file, every `has_error=true`
+  row is, and will remain, a genuine call failure, correctly excluded by
+  the default with no pattern-matching needed. k = solutions with
+  grades.passed=True, pass_rate = k/n. One row per (task, candidate
+  model). `model_metrics` below, by contrast, counts ALL solutions
+  including every kind of failure — it's reporting operational stats
+  (cost, latency, `complete_pct`), not a training label.
 - model_metrics, per model:
   - taskpass_pct: % of tasks with at least one correct solution (k>0 in targets).
   - complete_pct: % of solutions whose generation did not fail (gen_error IS NULL).
@@ -18,10 +39,30 @@ model_metrics and creates new active rows, from the solutions/grades that
 are active at this moment.
 """
 
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, not_, select, update
 from sqlalchemy.orm import Session
 
 from app.db.models import Grade, ModelMetric, Solution, Target
+
+# Deliberately a narrow ALLOWLIST (not the reverse): has_error=true is
+# excluded by default (the safe assumption for any call failure we don't
+# recognize — rate limits, timeouts, missing api keys, context-window
+# errors, connection drops, content-filter blocks, whatever a provider
+# throws next), and only a row matching this pattern is carved back IN as
+# a real attempt. See the module docstring — this only ever fires for the
+# historical experiment dataset's truncation rows.
+_TRUNCATION_GEN_ERROR_PATTERN = r"finish_reason=(length|max_tokens)"
+
+
+def _not_infra_error():
+    """True for a solution that counts as a real attempt: has_error=false,
+    or has_error=true but merely truncated (see _TRUNCATION_GEN_ERROR_PATTERN)."""
+    return not_(
+        and_(
+            Solution.has_error.is_(True),
+            not_(Solution.gen_error.op("~*")(_TRUNCATION_GEN_ERROR_PATTERN)),
+        )
+    )
 
 
 def recompute_targets(db: Session) -> int:
@@ -35,7 +76,7 @@ def recompute_targets(db: Session) -> int:
             func.count(Grade.solution_id).filter(Grade.passed.is_(True)).label("k"),
         )
         .outerjoin(Grade, (Grade.solution_id == Solution.solution_id) & Grade.active.is_(True))
-        .where(Solution.active.is_(True))
+        .where(Solution.active.is_(True), _not_infra_error())
         .group_by(Solution.task_id, Solution.model_id)
     ).all()
 

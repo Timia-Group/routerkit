@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy import insert, text, update
 from sqlalchemy.orm import Session
 
+from app.clients.llm_client import LlmClientError
 from app.db.base import get_db
 from app.db.models import Feature, Model, Question, Task
 from app.schemas import JobBoardEntry
@@ -23,6 +24,12 @@ from app.services.tasks_catalog import (
 router = APIRouter(tags=["features"])
 
 _KIND = "features_compute"
+# After this many consecutive LlmClientError's (each already past its own
+# internal retries in llm_client), the feature model is assumed to be down
+# for now — remaining not-yet-started (task, question) pairs are skipped
+# rather than each independently waiting out the same retries to confirm
+# it again (see services.concurrency.run_bounded's circuit_breaker).
+_CIRCUIT_BREAKER_THRESHOLD = 3
 
 
 def _bulk_deactivate_features(db: Session, keys: list[tuple[int, int]]) -> None:
@@ -85,13 +92,15 @@ class FeatureLoadRow(TaskIdentifier):
 
     question_key: str
     source: Literal["llm", "python"]
-    value: float
+    value: float | None = None
     answer_text: str | None = None
     answer_logprobs: str | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
     latency_ms: float | None = None
     cost_usd: float | None = None
+    gen_error: str | None = None
+    has_error: bool = False
 
 
 def _load_features_job(db: Session, progress: ProgressFn, rows: list[FeatureLoadRow]) -> dict:
@@ -143,6 +152,8 @@ def _load_features_job(db: Session, progress: ProgressFn, rows: list[FeatureLoad
             "output_tokens": row.output_tokens,
             "latency_ms": row.latency_ms,
             "cost_usd": row.cost_usd,
+            "gen_error": row.gen_error,
+            "has_error": row.has_error,
         }
         if i % jobs.PROGRESS_BATCH_SIZE == 0 or i == total:
             progress(i, total, f"resolved {i}/{total}")
@@ -181,6 +192,16 @@ def _calculate_features_job(db: Session, progress: ProgressFn) -> dict:
         try:
             result = compute_python_feature(task, question)
         except ScriptError as exc:
+            db.add(
+                Feature(
+                    task_id=task.task_id,
+                    question_id=question.question_id,
+                    source="python",
+                    cost_usd=0,
+                    gen_error=str(exc),
+                    has_error=True,
+                )
+            )
             errors.append({**task_ref(task), "question_key": question.question_key, "error": str(exc)})
         else:
             db.add(
@@ -200,13 +221,17 @@ def _calculate_features_job(db: Session, progress: ProgressFn) -> dict:
     # LLM: concurrent, up to feature_model.concurrency calls in flight.
     if feature_model is None:
         for task, question in llm_pairs:
-            errors.append(
-                {
-                    **task_ref(task),
-                    "question_key": question.question_key,
-                    "error": "question without a script and no active model with role='feature'",
-                }
+            error = "question without a script and no active model with role='feature'"
+            db.add(
+                Feature(
+                    task_id=task.task_id,
+                    question_id=question.question_id,
+                    source="llm",
+                    gen_error=error,
+                    has_error=True,
+                )
             )
+            errors.append({**task_ref(task), "question_key": question.question_key, "error": error})
             processed += 1
             progress(processed, total, f"{processed}/{total} processed")
     else:
@@ -214,9 +239,19 @@ def _calculate_features_job(db: Session, progress: ProgressFn) -> dict:
             llm_pairs,
             lambda pair: features_llm.compute_llm_feature(pair[0], pair[1], feature_model),
             feature_model.concurrency,
+            circuit_breaker=(LlmClientError, _CIRCUIT_BREAKER_THRESHOLD),
         )
         for (task, question), result, exc in llm_results:
             if exc is not None:
+                db.add(
+                    Feature(
+                        task_id=task.task_id,
+                        question_id=question.question_id,
+                        source="llm",
+                        gen_error=str(exc),
+                        has_error=True,
+                    )
+                )
                 errors.append({**task_ref(task), "question_key": question.question_key, "error": str(exc)})
             else:
                 db.add(
@@ -267,8 +302,10 @@ async def compute_features(
       those without a script are resolved by the single active model with
       role='feature', with up to `feature_model.concurrency` calls in
       flight at a time (see services.concurrency.run_bounded). An error
-      (from the script, the LLM, or the provider call) is reported in
-      `errors` without aborting the rest of the batch.
+      (from the script, the LLM, or the provider call) still inserts a row
+      (`has_error=true`, `gen_error` with the message, `value=NULL` — same
+      convention as `solutions`/`grades`) and is reported in `errors`,
+      without aborting the rest of the batch.
     - `type=load`: requires `file` (multipart), a `.jsonl` with one
       `FeatureLoadRow` per line — without calling any LLM or running any
       script. Each line identifies its task by `bcb_task_id` (benchmark) or
