@@ -68,6 +68,12 @@ from app.services.routing_calibration import (
 
 REPORT_LAMBDAS = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0, 2.0, 3.0, 4.0]
 _REPORT_RNG_SEED = 99  # separate stream from routing_calibration's own — reporting never perturbs the persisted lambdas
+# Minimum vertical share (of its column) a sankey node is allowed, even if
+# its real share of the flow is smaller — otherwise a 1-task node's label
+# overlaps its neighbors once node height is proportional to value (see
+# _build_sankey). With up to ~7 nodes per column, 0.06 leaves enough room
+# for one line of label text without flattening the big nodes' proportions.
+_SANKEY_MIN_NODE_FRACTION = 0.06
 _PALETTE = [
     "#4C78A8", "#F58518", "#54A24B", "#B279A2", "#E45756", "#72B7B2", "#EECA3B", "#9D755D",
 ]
@@ -211,9 +217,28 @@ def _build_sankey(
     node_x, node_y = [], []
     for col_idx, col in enumerate(columns):
         x = 0.001 if col_idx == 0 else 0.999 if col_idx == len(columns) - 1 else col_idx / (len(columns) - 1)
-        for row_idx, _n in enumerate(col):
+        # Position each node's center by its cumulative share of the
+        # column's total flow, not by plain row index — stacking by value
+        # (like a conventional Sankey) packs large nodes tightly instead of
+        # giving a 1-task node the same vertical slot as a 338-task one,
+        # which is what made the first version of this chart look sprawled
+        # out compared to the reference's compact layout. A pure proportional
+        # share, though, squeezes a 1-2 task node into a sliver too thin for
+        # its own label to fit without overlapping its neighbors — so each
+        # node's share is floored to _MIN_NODE_FRACTION before stacking
+        # (then the column's shares are renormalized back to 1 — this only
+        # meaningfully shrinks the dominant node(s), everything already
+        # above the floor is practically unaffected).
+        col_total = sum(node_size[n] for n in col) or 1
+        raw_fractions = [node_size[n] / col_total for n in col]
+        fractions = [max(_SANKEY_MIN_NODE_FRACTION, f) for f in raw_fractions]
+        fractions_total = sum(fractions) or 1
+        cumulative = 0.0
+        for _n, frac in zip(col, fractions, strict=True):
+            y = (cumulative + frac / 2) / fractions_total
             node_x.append(x)
-            node_y.append((row_idx + 0.5) / max(len(col), 1))
+            node_y.append(min(0.999, max(0.001, y)))
+            cumulative += frac
 
     def _node_color(n: str) -> str:
         return color_by_model[n.split(" · ")[0]]
