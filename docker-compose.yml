@@ -22,6 +22,16 @@ services:
     build: ./bigcodebench-api
     # No ports published to the host: only accessible from routerkit-api,
     # via the internal network, by design.
+    #
+    # Behind a profile: this service only builds/starts when the "local-eval"
+    # profile is active (see scripts/start.py). If BIGCODEBENCH_API_URL in
+    # .env points somewhere else (e.g. an instance deployed separately,
+    # Azure Container Apps or otherwise), there's no need to also run this
+    # ~25GB image locally — routerkit-api only ever talks to whatever URL
+    # it's given, over plain HTTP, no shared volumes or startup-order
+    # dependency on it.
+    profiles:
+      - local-eval
     networks:
       - routerkit-net
     restart: unless-stopped
@@ -30,15 +40,12 @@ services:
     build: ./routerkit-api
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-routerkit}:${POSTGRES_PASSWORD:-routerkit}@postgres:5432/${POSTGRES_DB:-routerkit}
-      BIGCODEBENCH_API_URL: http://bigcodebench-api:8000
       ARTIFACTS_DIR: /data/artifacts
     env_file:
       - .env
     depends_on:
       postgres:
         condition: service_healthy
-      bigcodebench-api:
-        condition: service_started
     ports:
       - "8000:8000"
     volumes:
