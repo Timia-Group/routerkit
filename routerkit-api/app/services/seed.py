@@ -19,9 +19,18 @@ dataset, mapping each row as follows:
     tags          <- libs (imports used by the reference solution)
     bcb_task_id   <- task_id (e.g. "BigCodeBench/12")
 
-The official dataset has 1140 tasks; 1135 remain here — BigCodeBench/101,
-/176, /363, /590 and /1005 were excluded because their tests depend on web
-pages that no longer exist (they can't be reliably validated).
+The official dataset has 1140 tasks; 1128 remain here. 5 were already
+excluded because their tests depend on web pages that no longer exist
+(BigCodeBench/101, /176, /363, /590, /1005 — can't be reliably
+validated), and a further 7 (BigCodeBench/59, /215, /233, /466, /642,
+/690, /734) were excluded because grading them disagreed between the
+`bigcodebench-evaluate` image tag this project pins
+(`bigcodebench-api/Dockerfile`) and the one originally used to produce
+this experiment's solutions/validations — verified against ~39k real
+comparisons, these 7 were the only ones with a meaningful (>25%)
+mismatch rate, almost certainly from a dependency version difference in
+whatever numeric library their official test relies on, not a flaw in
+the candidate solutions themselves.
 
 If the table already has any row (the user already loaded something, or
 this seed already ran before), it does nothing — it never overwrites a

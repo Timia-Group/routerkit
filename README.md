@@ -43,7 +43,7 @@ cp .env.example .env
 docker compose up --build
 ```
 
-On startup, `routerkit-api` runs against Postgres and exposes `http://localhost:8000` (Swagger UI at `/docs`). The first time the database is empty, it **automatically preloads the official BigCodeBench catalog** (1135 tasks — the full dataset has 1140, but 5 were excluded because their tests depend on web pages that no longer exist, see [`data/examples/tasks_exp.jsonl`](data/examples/tasks_exp.jsonl)) — no manual step is needed to have tasks available.
+On startup, `routerkit-api` runs against Postgres and exposes `http://localhost:8000` (Swagger UI at `/docs`). The first time the database is empty, it **automatically preloads the official BigCodeBench catalog** (1128 tasks — the full dataset has 1140, but 12 were excluded: 5 because their tests depend on web pages that no longer exist, and 7 because grading them disagreed between bigcodebench-evaluate image versions, see [`data/examples/tasks_exp.jsonl`](data/examples/tasks_exp.jsonl) and `app/services/seed.py`) — no manual step is needed to have tasks available.
 
 To start generating and evaluating solutions you also need to load feature questions and candidate models:
 

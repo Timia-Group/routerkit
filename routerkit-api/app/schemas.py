@@ -160,7 +160,7 @@ class CatalogReplaceResult(BaseModel):
     """Response of a catalog import endpoint (tasks/questions/models import
     all share this exact shape)."""
 
-    model_config = ConfigDict(json_schema_extra={"example": {"deactivated_previous": 11, "created": 1135}})
+    model_config = ConfigDict(json_schema_extra={"example": {"deactivated_previous": 11, "created": 1128}})
 
     deactivated_previous: int
     created: int

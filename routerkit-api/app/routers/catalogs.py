@@ -60,7 +60,7 @@ async def import_tasks(
     with the ones in this file.
 
     On startup, `routerkit-api` already auto-loads the official BigCodeBench
-    catalog (1135 tasks) if the table is empty (see `app.services.seed`) —
+    catalog (1128 tasks) if the table is empty (see `app.services.seed`) —
     this endpoint is for when the user wants to replace that catalog with
     their own. Each line decides its own type via `bcb_task_id`: with a
     value (e.g. "BigCodeBench/12") it's an official benchmark task, without
