@@ -6,13 +6,6 @@ answers. Stdlib only — no pip install needed to run this.
 Usage:
     python scripts/start.py [--force-download] [--base-url http://localhost:8000]
 
-Whether the local bigcodebench-api container (~25GB image) gets built and
-started depends on .env's BIGCODEBENCH_API_URL: left at its default (or
-unset), it's built locally like every other service; pointed at a
-separately-deployed instance instead, it's skipped entirely (docker
-compose's "local-eval" profile) — routerkit-api only ever needs that URL
-reachable over HTTP, nothing else changes.
-
 After this finishes, use scripts/run_pipeline.py to load catalogs/data and
 train a predictor through the API itself.
 """
@@ -31,8 +24,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 EXAMPLES_DIR = REPO_ROOT / "data" / "examples"
 RELEASE_BASE = "https://github.com/Timia-Group/routerkit/releases/latest/download"
 HEAVY_DATASETS = ["solutions_exp.jsonl", "validations_exp.jsonl"]
-# Must match docker-compose.yml's routerkit-api environment and .env.example.
-_DEFAULT_BIGCODEBENCH_URL = "http://bigcodebench-api:8000"
 
 
 def _log(msg: str) -> None:
@@ -47,24 +38,6 @@ def ensure_env_file() -> None:
     shutil.copy(example_path, env_path)
     _log(".env created from .env.example — fill in at least one LLM API key if you plan to "
          "use 'calculate' mode or POST /route later (not needed for the default load+train path).")
-
-
-def _wants_local_eval_container() -> bool:
-    """True unless .env points BIGCODEBENCH_API_URL somewhere other than
-    the local container — in which case there's nothing to build/start for
-    it (see docker-compose.yml's "local-eval" profile)."""
-    env_path = REPO_ROOT / ".env"
-    if not env_path.exists():
-        return True
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        if key.strip() == "BIGCODEBENCH_API_URL":
-            value = value.strip()
-            return value in ("", _DEFAULT_BIGCODEBENCH_URL)
-    return True
 
 
 def ensure_dataset(name: str, force: bool) -> None:
@@ -94,13 +67,11 @@ def ensure_dataset(name: str, force: bool) -> None:
     _log(f"{name}: ready ({target.stat().st_size:,} bytes).")
 
 
-def compose_up(local_eval: bool) -> None:
-    cmd = ["docker", "compose"]
-    if local_eval:
-        cmd += ["--profile", "local-eval"]
-    cmd += ["up", "-d", "--build"]
-    _log(f"{' '.join(cmd)} ...")
-    result = subprocess.run(cmd, cwd=REPO_ROOT, check=False)
+def compose_up() -> None:
+    _log("docker compose up -d --build ...")
+    result = subprocess.run(
+        ["docker", "compose", "up", "-d", "--build"], cwd=REPO_ROOT, check=False
+    )
     if result.returncode != 0:
         raise SystemExit(f"[start] docker compose up failed (exit code {result.returncode}).")
 
@@ -146,12 +117,7 @@ def main() -> None:
     if not args.skip_datasets:
         for name in HEAVY_DATASETS:
             ensure_dataset(name, force=args.force_download)
-    local_eval = _wants_local_eval_container()
-    if local_eval:
-        _log("BIGCODEBENCH_API_URL is unset/local — building and starting the local eval container too.")
-    else:
-        _log("BIGCODEBENCH_API_URL points elsewhere in .env — skipping the local eval container.")
-    compose_up(local_eval)
+    compose_up()
     wait_for_api(args.base_url)
     _log("Done. Next: python scripts/run_pipeline.py --help")
 
