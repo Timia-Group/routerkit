@@ -40,6 +40,22 @@ def ensure_env_file() -> None:
          "use 'calculate' mode or POST /route later (not needed for the default load+train path).")
 
 
+def _download_progress(blocks: int, block_size: int, total_size: int) -> None:
+    """urlretrieve reporthook: one line redrawn in place, terminal only —
+    these downloads are hundreds of MB, silence would look like a hang."""
+    if not sys.stdout.isatty():
+        return
+    done_mb = blocks * block_size / 1_000_000
+    if total_size > 0:
+        ratio = min(blocks * block_size / total_size, 1.0)
+        filled = round(30 * ratio)
+        line = (f"[start]   [{'#' * filled}{'-' * (30 - filled)}] {ratio * 100:5.1f}%  "
+                f"{done_mb:,.0f} / {total_size / 1_000_000:,.0f} MB")
+    else:
+        line = f"[start]   {done_mb:,.0f} MB downloaded"
+    print("\r" + line, end="", flush=True)
+
+
 def ensure_dataset(name: str, force: bool) -> None:
     target = EXAMPLES_DIR / name
     if target.exists() and not force:
@@ -51,7 +67,9 @@ def ensure_dataset(name: str, force: bool) -> None:
     gz_path = EXAMPLES_DIR / gz_name
     _log(f"{name}: downloading {url} ...")
     try:
-        urllib.request.urlretrieve(url, gz_path)  # noqa: S310 - fixed, hardcoded GitHub Releases URL
+        urllib.request.urlretrieve(url, gz_path, _download_progress)  # noqa: S310 - fixed, hardcoded GitHub Releases URL
+        if sys.stdout.isatty():
+            print(flush=True)
     except urllib.error.HTTPError as exc:
         raise SystemExit(
             f"[start] Failed to download {url} ({exc.code}). If this repo is still private, "

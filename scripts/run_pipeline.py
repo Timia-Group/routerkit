@@ -50,6 +50,7 @@ import argparse
 import json
 import mimetypes
 import re
+import shutil
 import sys
 import time
 import urllib.error
@@ -85,13 +86,57 @@ _STEP_JOB_KIND = {
 
 _PLACEHOLDER_RE = re.compile(r"<[A-Z][A-Z0-9_]*>")
 
+# Job messages carry their progress as "N/M ..." (see progress() in
+# routerkit-api's services/jobs.py) — that's all GET /jobs exposes of it.
+_FRACTION_RE = re.compile(r"(\d+)/(\d+)")
+_BAR_WIDTH = 30
+# Redraw one line in place only on a real terminal; piped/redirected output
+# (CI, a log file) keeps the one-line-per-change behaviour instead.
+_LIVE_PROGRESS = sys.stdout.isatty()
+_progress_line_open = False
+
 
 class PipelineError(RuntimeError):
     """Raised to stop the whole run — caught once, at the top level."""
 
 
+def _end_progress_line() -> None:
+    global _progress_line_open
+    if _progress_line_open:
+        print(flush=True)
+        _progress_line_open = False
+
+
 def _log(msg: str) -> None:
+    _end_progress_line()
     print(f"[pipeline] {msg}", flush=True)
+
+
+def _fmt_elapsed(seconds: float) -> str:
+    minutes, secs = divmod(int(seconds), 60)
+    return f"{minutes}m{secs:02d}s" if minutes else f"{secs}s"
+
+
+def _show_progress(message: str, elapsed: float) -> None:
+    """Live mode: redraws a single line — a bar when the message carries an
+    "N/M" fraction, plus elapsed time so a long phase with no countable
+    progress (training's grid search) still visibly ticks."""
+    global _progress_line_open
+    if not _LIVE_PROGRESS:
+        _log(f"  ... {message}")
+        return
+
+    bar = ""
+    match = _FRACTION_RE.search(message)
+    if match and int(match.group(2)) > 0:
+        ratio = min(int(match.group(1)) / int(match.group(2)), 1.0)
+        filled = round(_BAR_WIDTH * ratio)
+        bar = f"[{'#' * filled}{'-' * (_BAR_WIDTH - filled)}] {ratio * 100:5.1f}%  "
+
+    width = shutil.get_terminal_size().columns - 1
+    line = f"[pipeline]   {bar}{message}  ({_fmt_elapsed(elapsed)})"
+    print("\r" + line[:width].ljust(width), end="", flush=True)
+    _progress_line_open = True
 
 
 def _http_json(method: str, url: str, body: dict | None = None) -> dict:
@@ -185,10 +230,12 @@ def _run_sync_import(base_url: str, step: str, file_path: Path) -> None:
 
 
 def _poll_job(base_url: str, kind: str) -> dict:
-    """Polls GET /jobs every 2s, printing a new line only when the job's
-    message actually changes (not on every poll) — see module docstring on
-    why we don't want to print 100 near-identical lines for one job."""
+    """Polls GET /jobs every 2s. On a terminal, progress is one line redrawn
+    in place; otherwise a new line is printed only when the job's message
+    actually changes (not on every poll) — we don't want to print 100
+    near-identical lines for one job."""
     last_printed = None
+    started = time.monotonic()
     while True:
         jobs = _http_json("GET", f"{base_url}/jobs")
         entry = next((j for j in jobs if j["kind"] == kind), None)
@@ -196,11 +243,12 @@ def _poll_job(base_url: str, kind: str) -> dict:
             raise PipelineError(f"GET /jobs never returned a '{kind}' entry — unexpected API response.")
 
         if entry["status"] == "running":
-            if entry["message"] != last_printed:
-                _log(f"  ... {entry['message']}")
+            if _LIVE_PROGRESS or entry["message"] != last_printed:
+                _show_progress(entry["message"], time.monotonic() - started)
                 last_printed = entry["message"]
             time.sleep(2)
             continue
+        _end_progress_line()
 
         # status == "idle": job finished (successfully or not — see
         # to_board_entry in services/jobs.py: both show as "idle", the only
@@ -314,45 +362,58 @@ def main() -> None:
         "validations": args.validations,
     }
 
+    steps = STEP_ORDER[start_idx : until_idx + 1]
+    run_started = time.monotonic()
     try:
-        for step in STEP_ORDER[start_idx : until_idx + 1]:
-            if step == "train":
-                _run_train(args.base_url)
-                continue
-
-            if step in _STEP_IMPORT_PATH:
-                if overrides[step] is None and _STEP_DEFAULT_FILE[step] is None:
-                    _log(f"{step}: skipped (no --{step} given).")
-                    continue
-                file_path = _resolve_step_file(step, overrides[step])
-                if not file_path.exists():
-                    raise PipelineError(f"{step}: file not found: {file_path}")
-                if step == "models":
-                    _check_models_placeholders(file_path, assume_yes=args.yes)
-                _run_sync_import(args.base_url, step, file_path)
-                continue
-
-            # features / solutions / validations
-            if overrides[step] == "calculate":
-                _run_async_step(args.base_url, step, file_path=None, calculate=True, assume_yes=args.yes)
-            else:
-                file_path = _resolve_step_file(step, overrides[step])
-                if not file_path.exists():
-                    raise PipelineError(
-                        f"{step}: file not found: {file_path} — if this is one of the heavy "
-                        f"*_exp.jsonl datasets, run scripts/start.py first to download it."
-                    )
-                _run_async_step(args.base_url, step, file_path=file_path, calculate=False, assume_yes=args.yes)
+        for n, step in enumerate(steps, start=1):
+            print(flush=True)
+            _log(f"=== step {n}/{len(steps)}: {step} ===")
+            step_started = time.monotonic()
+            _run_step(args, step, overrides[step] if step != "train" else None)
+            _log(f"{step}: finished in {_fmt_elapsed(time.monotonic() - step_started)}")
 
     except PipelineError as exc:
         _log(f"STOPPED: {exc}")
         _log(f"Fix the issue above, then resume with: --start-from={step}")
         sys.exit(1)
 
+    print(flush=True)
+    total = _fmt_elapsed(time.monotonic() - run_started)
     if args.until == "train":
-        _log("Pipeline complete — predictor trained and ready for POST /route.")
+        _log(f"Pipeline complete in {total} — predictor trained and ready for POST /route.")
     else:
-        _log(f"Pipeline complete — stopped after '{args.until}' as requested (--until), no training run.")
+        _log(f"Pipeline complete in {total} — stopped after '{args.until}' as requested (--until), "
+             "no training run.")
+
+
+def _run_step(args: argparse.Namespace, step: str, override: str | None) -> None:
+    if step == "train":
+        _run_train(args.base_url)
+        return
+
+    if step in _STEP_IMPORT_PATH:
+        if override is None and _STEP_DEFAULT_FILE[step] is None:
+            _log(f"{step}: skipped (no --{step} given).")
+            return
+        file_path = _resolve_step_file(step, override)
+        if not file_path.exists():
+            raise PipelineError(f"{step}: file not found: {file_path}")
+        if step == "models":
+            _check_models_placeholders(file_path, assume_yes=args.yes)
+        _run_sync_import(args.base_url, step, file_path)
+        return
+
+    # features / solutions / validations
+    if override == "calculate":
+        _run_async_step(args.base_url, step, file_path=None, calculate=True, assume_yes=args.yes)
+    else:
+        file_path = _resolve_step_file(step, override)
+        if not file_path.exists():
+            raise PipelineError(
+                f"{step}: file not found: {file_path} — if this is one of the heavy "
+                f"*_exp.jsonl datasets, run scripts/start.py first to download it."
+            )
+        _run_async_step(args.base_url, step, file_path=file_path, calculate=False, assume_yes=args.yes)
 
 
 if __name__ == "__main__":

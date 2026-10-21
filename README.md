@@ -70,7 +70,13 @@ curl -X POST localhost:8000/route -H "Content-Type: application/json" \
 
 ### Easiest path: `scripts/`
 
-The above is the manual, step-by-step version. For the common case — stand everything up and reproduce the real experiment, with zero LLM cost — two Python scripts (stdlib only, no `pip install` needed) do it in two commands:
+The above is the manual, step-by-step version. If you're installing for the first time or aren't sure which commands you need, start with the interactive wizard. It asks every decision up front (reproduce the experiment, a custom run with your own catalogs or live LLM calls, retrain, or try the router on prompts), then checks what those answers need: Python 3.10+, Docker running with Compose v2, enough free disk space (~20 GB on the first install), the experiment datasets, and the API keys/endpoints of any model that will be called live, offering to fill in missing keys (saved to `.env`) and `<...>` placeholders (saved to a gitignored `*.local.json` copy of the models file). Finally it shows the exact commands below that fit your answers and runs them step by step with live progress:
+
+```bash
+python scripts/wizard.py
+```
+
+For the common case — stand everything up and reproduce the real experiment, with zero LLM cost — two Python scripts (stdlib only, no `pip install` needed) do it in two commands:
 
 ```bash
 python scripts/start.py          # downloads the heavy datasets if missing, brings up docker-compose, waits for the API
@@ -192,8 +198,10 @@ routerkit/
 ├── docker-compose.yml
 ├── .env.example
 ├── scripts/
+│   ├── wizard.py                  # interactive guide: asks, then runs the scripts below
 │   ├── start.py                   # downloads datasets, docker compose up, waits for the API
-│   └── run_pipeline.py            # runs the full pipeline end to end (see Quick start)
+│   ├── run_pipeline.py            # runs the full pipeline end to end (see Quick start)
+│   └── test_route.py              # calls POST /route with one prompt, prints the ranking
 ├── postgres/
 │   └── init/001_schema.sql        # full, commented DDL
 ├── bigcodebench-api/

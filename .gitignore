@@ -34,6 +34,11 @@ __pycache__/
 /data/examples/models_test_small.json
 /data/examples/models_test_full.json
 
+# Models catalogs with their <...> placeholders filled in by
+# scripts/wizard.py (real endpoints) — written next to the original,
+# which stays untouched.
+*.local.json
+
 # Trained predictor artifacts (.joblib) — regenerable via POST /train,
 # same reasoning as solutions_exp/validations_exp above.
 /data/predictors/
