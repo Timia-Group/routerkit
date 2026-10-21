@@ -4,6 +4,11 @@ validations -> train) against an already-running routerkit-api, one step
 at a time, waiting for each async job to finish and checking it for errors
 before moving on. Stdlib only — no pip install needed.
 
+scripts/wizard.py imports this module directly and reaches into a few of
+its underscore-prefixed names (_STEP_DEFAULT_FILE, _PLACEHOLDER_RE,
+_resolve_step_file) rather than duplicating them — grep wizard.py for a
+name here before renaming or removing it.
+
 Surfaces every problem instead of silently tolerating it the way the API
 itself does: the step's own HTTP call failing or the job itself raising an
 exception always stops the run immediately. A batch that finished with

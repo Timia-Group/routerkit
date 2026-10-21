@@ -14,6 +14,14 @@ It never talks to the API on its own: every step is a plain command (the
 other scripts — start.py, run_pipeline.py, test_route.py — or docker),
 printed before it runs, so next time you can run the same thing yourself
 without the wizard.
+
+Imports run_pipeline/start as modules (not just subprocess targets) to
+reuse their own constants/helpers instead of re-deriving them here. Of
+run_pipeline's, only STEP_ORDER is actually public; _STEP_DEFAULT_FILE,
+_PLACEHOLDER_RE and _resolve_step_file are its own internals, reused
+anyway rather than duplicated. If you rename or restructure any of those
+four in run_pipeline.py, grep this file for the name first — nothing
+else enforces that contract.
 """
 
 import sys
@@ -39,12 +47,20 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 EXAMPLES_DIR = REPO_ROOT / "data" / "examples"
 ENV_FILE = REPO_ROOT / ".env"
 REPORT_INDEX = REPO_ROOT / "data" / "current" / "report" / "index.html"
+# What's REALLY active in the database right now — rewritten by the API on
+# every catalog import (app/services/snapshots.py), independent of
+# whichever file a human remembers loading, or whether a .local.json copy
+# made afterwards was ever actually imported. Used to check readiness for
+# 'route' (nothing gets imported for that goal, so there's no other way to
+# know what the database currently holds — see _check_live_calls).
+ACTIVE_MODELS_SNAPSHOT = REPO_ROOT / "data" / "current" / "models.json"
 BCB_DOCKERFILE = REPO_ROOT / "bigcodebench-api" / "Dockerfile"
 DEFAULT_MODELS = EXAMPLES_DIR / run_pipeline._STEP_DEFAULT_FILE["models"]
 # Imported explicitly rather than relying on routerkit-api's startup seed:
 # the seed only runs on an empty database, so after anyone loads their own
 # tasks, "the official catalog" would otherwise silently not be what's active.
-OFFICIAL_TASKS_ARG = "--tasks=data/examples/tasks_exp.jsonl"
+OFFICIAL_TASKS_FILE = EXAMPLES_DIR / "tasks_exp.jsonl"
+OFFICIAL_TASKS_ARG = f"--tasks={OFFICIAL_TASKS_FILE.relative_to(REPO_ROOT).as_posix()}"
 
 # Free disk space to ask for before the first build: the bigcodebench base
 # image alone is ~9.5GB unpacked, plus its compressed layers while pulling,
@@ -94,6 +110,10 @@ class Command:
     @property
     def is_pipeline(self) -> bool:
         return "scripts/run_pipeline.py" in self.program
+
+    @property
+    def is_start(self) -> bool:
+        return "scripts/start.py" in self.program
 
 
 @dataclass
@@ -230,6 +250,25 @@ def _continue_or_quit(reason: str, continue_detail: str) -> None:
 # Phase 1: questions
 # --------------------------------------------------------------------------
 
+def _warn_resets_active_experiment() -> None:
+    """Both 'Reproduce' and 'Custom run' start from the 'tasks' step, and
+    tasks/questions/models are always a full replace (see catalogs.py) —
+    never incremental, regardless of how small the actual change is. That
+    cascades (app/services/cascade.py) to deactivate whatever
+    features/solutions/grades/targets were already active, and the
+    currently active predictor along with them. Silent only because
+    ACTIVE_MODELS_SNAPSHOT existing is the one cheap, already-available
+    signal that a previous run left something active to lose — a brand
+    new install has nothing to warn about."""
+    if not ACTIVE_MODELS_SNAPSHOT.exists():
+        return
+    print()
+    _say("NOTE: this reloads tasks/questions/models from scratch, which resets whatever")
+    _say("was already active here (including any trained predictor) - even if the change")
+    _say("you want feels small (e.g. just recomputing one step). To train again on data")
+    _say("that's already loaded without resetting it, quit and choose 'Retrain only' instead.")
+
+
 def _ask_unattended(calls_llms: bool) -> list[str]:
     """Only a run that calls LLMs gets the question: there, many failed rows
     usually mean a misconfigured model burning money, worth pausing for.
@@ -275,6 +314,7 @@ def _questions_reproduce() -> Plan:
     _say("Loads the experiment's precomputed features, solutions and grades and trains a")
     _say("predictor on them. No LLM calls, no cost, no API keys. About 15 minutes, plus a")
     _say("one-off download of ~10 GB of Docker images on the first install.")
+    _warn_resets_active_experiment()
     want_routing = _ask_want_routing(feature_called=False, other_llms_called=False)
     return Plan(
         goal="reproduce",
@@ -324,9 +364,10 @@ def _questions_custom() -> Plan:
     _section("Custom run")
     _say("One question per pipeline step. The experiment's files are the default;")
     _say("anything you change replaces just that part.")
+    _warn_resets_active_experiment()
 
     args: list[str] = []
-    tasks_count = sum(1 for _ in (EXAMPLES_DIR / "tasks_exp.jsonl").open(encoding="utf-8"))
+    tasks_count = sum(1 for _ in OFFICIAL_TASKS_FILE.open(encoding="utf-8"))
     custom_tasks = _ask_choice(
         "Which tasks should the router learn from?",
         [
@@ -576,19 +617,29 @@ def _filled_copy_path(models_file: Path) -> Path:
     return models_file.with_name(f"{models_file.stem}.local.json")
 
 
-def _missing_roles(models_file: Path, roles: frozenset[str]) -> list[str]:
+def _load_models_list(models_file: Path) -> list[dict]:
+    return json.loads(models_file.read_text(encoding="utf-8")).get("models", [])
+
+
+def _load_active_models_snapshot() -> list[dict] | None:
+    """None if nothing has ever been imported here (the snapshot doesn't
+    exist yet) — see ACTIVE_MODELS_SNAPSHOT."""
+    if not ACTIVE_MODELS_SNAPSHOT.exists():
+        return None
+    return json.loads(ACTIVE_MODELS_SNAPSHOT.read_text(encoding="utf-8"))
+
+
+def _missing_roles(models: list[dict], roles: frozenset[str]) -> list[str]:
     """Roles this run calls that have no model at all in the catalog (e.g.
     models_exp.json has no 'judge') — every call for them would fail."""
-    models = json.loads(models_file.read_text(encoding="utf-8")).get("models", [])
     present = {m.get("role") for m in models}
     return sorted(roles - present)
 
 
-def _live_call_gaps(models_file: Path, roles: frozenset[str]) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+def _live_call_gaps(models: list[dict], roles: frozenset[str]) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
     """For the models with one of `roles`: placeholders still in their rows
     and API-key variables still empty in .env, each mapped to the models
     that need it."""
-    models = json.loads(models_file.read_text(encoding="utf-8")).get("models", [])
     env = _read_env()
     placeholders: dict[str, list[str]] = {}
     keys: dict[str, list[str]] = {}
@@ -636,21 +687,36 @@ def _check_live_calls(plan: Plan) -> None:
     """Loops until the models that will really be called look usable, or the
     user explicitly chooses to go on anyway (or quit).
 
-    For 'route' the catalog was already loaded into the database by a
-    previous run: filling its placeholders in now wouldn't reach the
-    database, so only missing keys (read from .env at call time) can still
-    be fixed here."""
+    For 'route', nothing gets imported by this run — the catalog is
+    whatever a *previous* run already loaded into the database, so this
+    checks data/current/models.json (ACTIVE_MODELS_SNAPSHOT: the live
+    snapshot the API rewrites on every catalog import, see
+    app/services/snapshots.py) instead of plan.models_file. Checking the
+    file instead would be checking the wrong thing twice over: filling its
+    placeholders now wouldn't reach the database either way, AND the file
+    the user remembers loading may not even be what's active any more (a
+    `.local.json` copy filled in after the fact, but never actually
+    (re)loaded, would make this check falsely report "ready"). Every other
+    goal checks plan.models_file, correctly: nothing has been imported yet
+    at that point, so the file IS the thing about to become real."""
     if not plan.live_roles:
         return
     placeholders_fixable = plan.goal != "route"
+    checking_snapshot = plan.goal == "route" and ACTIVE_MODELS_SNAPSHOT.exists()
+    if plan.goal == "route" and not checking_snapshot:
+        _detail(f"No record of what's actually active ({_relative(ACTIVE_MODELS_SNAPSHOT)} doesn't exist "
+                "yet, so nothing looks to have been loaded here before) - checking "
+                f"{_relative(plan.models_file)} instead, which may not match the database.")
     while True:
-        missing_roles = _missing_roles(plan.models_file, plan.live_roles)
-        placeholders, keys = _live_call_gaps(plan.models_file, plan.live_roles)
+        models = _load_active_models_snapshot() if checking_snapshot else _load_models_list(plan.models_file)
+        source_label = "the database's active catalog" if checking_snapshot else _relative(plan.models_file)
+        missing_roles = _missing_roles(models, plan.live_roles)
+        placeholders, keys = _live_call_gaps(models, plan.live_roles)
         if not missing_roles and not placeholders and not keys:
             _ok(f"Endpoints and API keys are filled in for: {', '.join(sorted(plan.live_roles))}"
-                f" ({_relative(plan.models_file)}).")
+                f" ({source_label}).")
             return
-        _fail(f"Models that will be called aren't ready ({_relative(plan.models_file)}):")
+        _fail(f"Models that will be called aren't ready ({source_label}):")
         for role in missing_roles:
             _detail(f"- no model with role '{role}' in this catalog"
                     + (" (it grades your own tasks)" if role == "judge" else "")
@@ -745,7 +811,7 @@ def _placeholder_note(plan: Plan, pipeline: Command | None) -> list[str]:
         return []
     if not run_pipeline._PLACEHOLDER_RE.search(plan.models_file.read_text(encoding="utf-8")):
         return []
-    if _live_call_gaps(plan.models_file, plan.live_roles)[0]:
+    if _live_call_gaps(_load_models_list(plan.models_file), plan.live_roles)[0]:
         return ["Note: the pipeline will warn that the models file still has <...> placeholders.",
                 "Some belong to models this run calls (you chose to continue anyway), so the",
                 "steps that call them will fail - answer 'n' there if you'd rather stop first."]
@@ -796,9 +862,16 @@ def _execute(commands: list[Command], total: int) -> None:
             if command.program[0] == "docker":
                 _detail("If the disk filled up or Docker stopped responding, free space, restart")
                 _detail("Docker Desktop, then retry - layers already downloaded are kept.")
+            if command.is_start:
+                _detail("If a dataset download looked incomplete or corrupted above, answer 'y' next")
+                _detail("to redownload it instead of reusing the partial file.")
             _retry_or_quit(f"step {n}/{total} failed", "Retry this step")
             if command.is_pipeline:
                 command.program = _resume_program(command.program)
+            elif command.is_start and "--force-download" not in command.program:
+                if _ask_yes_no("Redownload the experiment datasets instead of reusing what's there?",
+                                default=False):
+                    command.program = [*command.program, "--force-download"]
 
 
 def _route_loop(n: int, total: int) -> None:
