@@ -608,6 +608,24 @@ def _key_env_for(model: dict) -> str | None:
     return _PROVIDER_API_KEY_ENV.get(provider)
 
 
+def _live_endpoint_fixes(models: list[dict], roles: frozenset[str]) -> dict[str, list[tuple[int, str]]]:
+    """Like _live_call_gaps's placeholders, but only for the `endpoint`
+    field specifically, and only for models that carry a `model_id` (i.e.
+    came from ACTIVE_MODELS_SNAPSHOT, not a not-yet-imported file) — the
+    one field PATCH /models/{model_id} (scripts/edit_model.py) can fix in
+    the database directly, in place, with no reimport/cascade. A
+    placeholder anywhere else (rare in practice — every real case so far
+    has been `endpoint`) still only shows up in the generic warning,
+    unfixable from here."""
+    fixes: dict[str, list[tuple[int, str]]] = {}
+    for model in models:
+        if model.get("role") not in roles or "model_id" not in model:
+            continue
+        for placeholder in run_pipeline._PLACEHOLDER_RE.findall(str(model.get("endpoint") or "")):
+            fixes.setdefault(placeholder, []).append((model["model_id"], model.get("name", "?")))
+    return fixes
+
+
 def _filled_copy_path(models_file: Path) -> Path:
     """Where the wizard writes a models file with its placeholders filled
     in — never over the original (it's versioned), and *.local.json is
@@ -683,6 +701,27 @@ def _fill_in_placeholders(models_file: Path, placeholders: dict[str, list[str]])
     return target
 
 
+def _fix_live_endpoints(fixes: dict[str, list[tuple[int, str]]]) -> None:
+    """Asks for each placeholder's real value and applies it straight to
+    the database via PATCH /models/{model_id} (scripts/edit_model.py) — no
+    reimport, no cascade, nothing else gets touched."""
+    for placeholder, affected in fixes.items():
+        print()
+        _say(f"{placeholder} - used by {', '.join(name for _id, name in affected)}")
+        value = _input("  Real value (e.g. your resource name or gateway URL, Enter to skip): ")
+        if not value:
+            continue
+        for model_id, name in affected:
+            result = subprocess.run(
+                [sys.executable, "scripts/edit_model.py", str(model_id), f"--endpoint={value}"],
+                cwd=REPO_ROOT, check=False,
+            )
+            if result.returncode == 0:
+                _ok(f"Updated {name} (model_id={model_id}) in the database.")
+            else:
+                _fail(f"Could not update {name} (model_id={model_id}) - see the message above.")
+
+
 def _check_live_calls(plan: Plan) -> None:
     """Loops until the models that will really be called look usable, or the
     user explicitly chooses to go on anyway (or quit).
@@ -712,6 +751,7 @@ def _check_live_calls(plan: Plan) -> None:
         source_label = "the database's active catalog" if checking_snapshot else _relative(plan.models_file)
         missing_roles = _missing_roles(models, plan.live_roles)
         placeholders, keys = _live_call_gaps(models, plan.live_roles)
+        live_fixes = _live_endpoint_fixes(models, plan.live_roles) if checking_snapshot else {}
         if not missing_roles and not placeholders and not keys:
             _ok(f"Endpoints and API keys are filled in for: {', '.join(sorted(plan.live_roles))}"
                 f" ({source_label}).")
@@ -725,18 +765,25 @@ def _check_live_calls(plan: Plan) -> None:
             _detail(f"- placeholder {placeholder}, used by {', '.join(users)}")
         for env_var, users in keys.items():
             _detail(f"- {env_var} empty in .env, used by {', '.join(users)}")
-        if placeholders and not placeholders_fixable:
-            _detail("That catalog was loaded with these placeholders, so the database has them too -")
-            _detail("filling them in now wouldn't help. Run the wizard again with 'Reproduce' or")
-            _detail("'Custom run' and answer 'y' to the prompt testing: it asks for them first.")
+        unfixable_placeholders = placeholders.keys() - live_fixes.keys() if not placeholders_fixable else {}
+        if unfixable_placeholders:
+            _detail("The ones above not listed as fixable below belong to a field this wizard can only")
+            _detail("edit through a full reimport (see 'Reproduce'/'Custom run') - filling them in on")
+            _detail("disk wouldn't reach the database.")
 
         fill_placeholders = bool(placeholders) and placeholders_fixable
+        fix_live = bool(live_fixes) and not placeholders_fixable
         options, actions = [], []
-        if keys or fill_placeholders:
-            options.append((f"Enter the missing {'values' if fill_placeholders else 'API keys'} now",
-                            "keys are typed hidden and saved in .env"))
+        if keys or fill_placeholders or fix_live:
+            label = "Enter the missing values now" if fill_placeholders or fix_live else "Enter the missing API keys now"
+            detail_parts = []
+            if keys:
+                detail_parts.append("keys are typed hidden and saved in .env")
+            if fix_live:
+                detail_parts.append("endpoints are applied straight to the database (no reimport)")
+            options.append((label, "; ".join(detail_parts)))
             actions.append("fill")
-        if keys or fill_placeholders or missing_roles:
+        if keys or fill_placeholders or fix_live or missing_roles:
             edited = "the files" if fill_placeholders or missing_roles else ".env"
             options.append((f"I've edited {edited} myself, check again", ""))
             actions.append("recheck")
@@ -752,6 +799,8 @@ def _check_live_calls(plan: Plan) -> None:
             _fill_in_keys(keys)
             if placeholders and placeholders_fixable:
                 plan.models_file = _fill_in_placeholders(plan.models_file, placeholders)
+            if fix_live:
+                _fix_live_endpoints(live_fixes)
         elif action == "continue":
             return
         elif action == "quit":

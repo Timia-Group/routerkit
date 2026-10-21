@@ -156,6 +156,33 @@ class ModelImportRow(BaseModel):
     role: Literal["candidate", "feature", "judge"]
 
 
+class ModelPatchRow(BaseModel):
+    """Body of `PATCH /models/{model_id}` — edits connection fields of a
+    single already-active model in place (e.g. replacing a `<...>`
+    placeholder with a real endpoint). Deliberately NOT the full
+    `ModelImportRow` shape: `name`/`role`/`type` are excluded on purpose —
+    changing those has structural implications (role drives the one-hot
+    column a trained predictor already has baked in; name is the stable
+    key solutions/targets are matched against) that a full re-import
+    (with its cascade) is the right tool for, not this endpoint. Every
+    field is optional and left alone unless explicitly included in the
+    request body (`exclude_unset`, not merely non-null — this is how you
+    deliberately clear api_key_env back to None, for instance)."""
+
+    # extra="forbid": a typo'd or unsupported field (e.g. "name", trying to
+    # rename the model here) is a clear 422, not silently dropped — Pydantic
+    # ignores unknown fields by default, which would otherwise make that
+    # part of the request look accepted when it was actually a no-op.
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={"example": {"endpoint": "https://my-real-resource.openai.azure.com"}},
+    )
+
+    endpoint: str | None = None
+    api_key_env: str | None = None
+    deployment: str | None = None
+
+
 class CatalogReplaceResult(BaseModel):
     """Response of a catalog import endpoint (tasks/questions/models import
     all share this exact shape)."""

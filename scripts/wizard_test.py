@@ -66,6 +66,62 @@ class MissingRoles(unittest.TestCase):
                          ["feature", "judge"])
 
 
+class LiveEndpointFixes(unittest.TestCase):
+    def test_placeholder_in_endpoint_is_fixable(self):
+        models = [{"model_id": 16, "name": "gpt-5.4", "role": "feature",
+                   "endpoint": "https://<YOUR_AZURE_FOUNDRY_RESOURCE>.openai.azure.com"}]
+        fixes = wizard._live_endpoint_fixes(models, frozenset({"feature"}))
+        self.assertEqual(fixes, {"<YOUR_AZURE_FOUNDRY_RESOURCE>": [(16, "gpt-5.4")]})
+
+    def test_model_without_model_id_is_not_fixable(self):
+        # Came from a not-yet-imported file (models_file, not the
+        # snapshot) — there's no row in the database yet to PATCH.
+        models = [{"name": "gpt-5.4", "role": "feature",
+                   "endpoint": "https://<YOUR_AZURE_FOUNDRY_RESOURCE>.openai.azure.com"}]
+        self.assertEqual(wizard._live_endpoint_fixes(models, frozenset({"feature"})), {})
+
+    def test_wrong_role_is_ignored(self):
+        models = [{"model_id": 9, "name": "Grok 4.6", "role": "candidate",
+                   "endpoint": "https://<SPHERON_GATEWAY_URL>"}]
+        self.assertEqual(wizard._live_endpoint_fixes(models, frozenset({"feature"})), {})
+
+    def test_placeholder_outside_endpoint_is_not_fixable(self):
+        # By design — PATCH /models/{id} (and this helper) only ever
+        # targets the endpoint field, the one place this has actually
+        # happened in practice so far.
+        models = [{"model_id": 16, "name": "gpt-5.4", "role": "feature",
+                   "endpoint": "https://real.example.com", "deployment": "<SOME_PLACEHOLDER>"}]
+        self.assertEqual(wizard._live_endpoint_fixes(models, frozenset({"feature"})), {})
+
+    def test_no_placeholder_returns_empty(self):
+        models = [{"model_id": 16, "name": "gpt-5.4", "role": "feature", "endpoint": "https://real.example.com"}]
+        self.assertEqual(wizard._live_endpoint_fixes(models, frozenset({"feature"})), {})
+
+
+class FixLiveEndpoints(unittest.TestCase):
+    """_fix_live_endpoints shells out to scripts/edit_model.py (so the fix
+    is still "a plain command", consistent with every other wizard step) —
+    mock subprocess.run rather than hitting a real API."""
+
+    def test_calls_edit_model_with_the_typed_value_for_every_affected_model(self):
+        fixes = {"<PLACEHOLDER>": [(16, "gpt-5.4"), (17, "other-feature-model")]}
+        with patch.object(wizard, "_input", return_value="https://real.example.com"), \
+             patch.object(wizard.subprocess, "run") as mock_run:
+            mock_run.return_value = wizard.subprocess.CompletedProcess(args=[], returncode=0)
+            wizard._fix_live_endpoints(fixes)
+        self.assertEqual(mock_run.call_count, 2)
+        called_argvs = [call.args[0] for call in mock_run.call_args_list]
+        self.assertTrue(all("16" in argv or "17" in argv for argv in called_argvs))
+        self.assertTrue(all("--endpoint=https://real.example.com" in argv for argv in called_argvs))
+
+    def test_empty_input_skips_that_placeholder_entirely(self):
+        fixes = {"<PLACEHOLDER>": [(16, "gpt-5.4")]}
+        with patch.object(wizard, "_input", return_value=""), \
+             patch.object(wizard.subprocess, "run") as mock_run:
+            wizard._fix_live_endpoints(fixes)
+        mock_run.assert_not_called()
+
+
 class LiveCallGaps(unittest.TestCase):
     """_live_call_gaps reads .env via _read_env(), which reads
     wizard.ENV_FILE (or .env.example as a fallback) — point both at a

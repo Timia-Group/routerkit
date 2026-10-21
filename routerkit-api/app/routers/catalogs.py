@@ -1,16 +1,22 @@
 """Catalog import (tasks.jsonl, questions.json, models.json) into Postgres.
 
-All input is JSON (standardized). The 3 endpoints receive a file (multipart)
-and return how many rows were created/deactivated. The shape and accepted
-values of each row are documented in `app.schemas` (TaskImportRow,
-QuestionImportRow, ModelImportRow) and are validated before inserting: an
-invalid row aborts the whole import with 422 and the error detail. All 3 are
-a replacement with soft delete (cascade included via app.services.cascade):
-they deactivate what exists and activate only what came in the latest
-upload, never touching a row already used by a previous experiment.
-Additionally, each one leaves a snapshot of the resulting active state in
-data/current (rotating the previous one to data/previous, see
-app.services.snapshots).
+All input is JSON (standardized). The 3 import endpoints receive a file
+(multipart) and return how many rows were created/deactivated. The shape
+and accepted values of each row are documented in `app.schemas`
+(TaskImportRow, QuestionImportRow, ModelImportRow) and are validated before
+inserting: an invalid row aborts the whole import with 422 and the error
+detail. All 3 are a replacement with soft delete (cascade included via
+app.services.cascade): they deactivate what exists and activate only what
+came in the latest upload, never touching a row already used by a previous
+experiment. Additionally, each one leaves a snapshot of the resulting
+active state in data/current (rotating the previous one to data/previous,
+see app.services.snapshots).
+
+A 4th endpoint, `PATCH /models/{model_id}`, is the deliberate exception to
+all of the above: it edits a few connection fields of ONE already-active
+model in place — no replacement, no cascade, no deactivating anything —
+for the specific case of fixing an endpoint/key after the fact without
+redoing a full import (see its own docstring for why).
 """
 
 import json
@@ -22,7 +28,7 @@ from sqlalchemy.orm import Session
 
 from app.db.base import get_db
 from app.db.models import Model, Question
-from app.schemas import CatalogReplaceResult, ModelImportRow, QuestionImportRow
+from app.schemas import CatalogReplaceResult, ModelImportRow, ModelPatchRow, QuestionImportRow
 from app.services import cascade
 from app.services.snapshots import row_to_dict, write_snapshot
 from app.services.tasks_catalog import parse_tasks_jsonl, replace_tasks
@@ -351,3 +357,46 @@ async def import_models(
     write_snapshot("models", [row_to_dict(m) for m in active_models])
 
     return {"deactivated_previous": len(deactivated_ids), "created": len(rows)}
+
+
+@router.patch(
+    "/models/{model_id}",
+    summary="Edits connection fields of a single active model in place — no cascade",
+)
+async def patch_model(
+    model_id: int,
+    body: ModelPatchRow,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Updates `endpoint`/`api_key_env`/`deployment` of ONE already-active
+    model, in place — typically to replace a `<...>` placeholder with its
+    real value after realizing only afterwards that it was still needed
+    (e.g. before trying `POST /route`), without redoing a full
+    `/models/import` (which would deactivate — cascading to solutions,
+    targets, model_metrics, and the active predictor — everything already
+    computed from the current catalog just to fix one field).
+
+    404 if `model_id` doesn't exist or isn't active. 422 if the request
+    body is empty (nothing to change). Only the fields actually present in
+    the request body are touched — `name`/`role`/`type` can't be changed
+    here at all (see `ModelPatchRow`). Rewrites `data/current/models.json`
+    (same snapshot `/models/import` writes) so anything that reads it
+    — including `scripts/wizard.py`'s readiness check — sees the edit
+    immediately.
+    """
+    model = db.query(Model).filter(Model.model_id == model_id, Model.active.is_(True)).one_or_none()
+    if model is None:
+        raise HTTPException(status_code=404, detail=f"no active model with model_id={model_id}")
+
+    changed = body.model_dump(exclude_unset=True)
+    if not changed:
+        raise HTTPException(status_code=422, detail="no fields to update (request body was empty)")
+    for field, value in changed.items():
+        setattr(model, field, value)
+    db.commit()
+    db.refresh(model)
+
+    active_models = db.query(Model).filter(Model.active.is_(True)).all()
+    write_snapshot("models", [row_to_dict(m) for m in active_models])
+
+    return row_to_dict(model)
