@@ -51,7 +51,7 @@ OPENAPI_TAGS = [
     {"name": "features", "description": "(Async) computation of LLM/programmatic features over active tasks/questions."},
     {
         "name": "training",
-        "description": "Training of the predictor (fixed GradientBoostingRegressor) with active features/targets.",
+        "description": "Training of the predictor (see POST /train for the available algorithms) with active features/targets.",
     },
     {"name": "routing", "description": "Routes a task to the best candidate LLM using the active predictor."},
     {

@@ -2,6 +2,14 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# libgomp1: LightGBM's native library needs it (OpenMP runtime) — not
+# present in the slim base image, fails at import time otherwise
+# ("libgomp.so.1: cannot open shared object file") rather than at
+# training time, so this is caught at build, not left for POST /train
+# to discover.
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

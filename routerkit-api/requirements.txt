@@ -6,10 +6,23 @@ pydantic-settings>=2.2,<3.0
 httpx>=0.27,<1.0
 python-multipart>=0.0.9,<1.0
 litellm>=1.50,<2.0
+# litellm.responses() (app/clients/llm_client.py, api_kind="responses")
+# unconditionally tries an internal MCP-gateway dispatch check that imports
+# the `mcp` package — never declared as litellm's own dependency, so any
+# api_kind="responses" call raises ModuleNotFoundError without it, even
+# though this project never uses MCP at all. Pre-existing latent bug,
+# unrelated to anything in this repo; just needs the import satisfied.
+mcp>=1.0,<3.0
 
-# Predictor training (services/training.py): fixed algorithm
-# (GradientBoostingRegressor), no AutoML library, no user-facing choice.
+# Predictor training (services/training.py): a small registry of
+# algorithms to choose from (or bake off against each other) — see
+# ALGORITHMS there. xgboost-cpu, not xgboost: the default `xgboost` wheel
+# pulls in nvidia-nccl-cu12 (a GPU-only dependency, ~470MB) even though
+# this runs CPU-only (tree_method="hist") — xgboost-cpu is the same
+# library without that dead weight (~19MB vs ~700MB total).
 scikit-learn>=1.5,<2.0
+xgboost-cpu>=2.1,<4.0
+lightgbm>=4.5,<5.0
 pandas>=2.2,<3.0
 joblib>=1.4,<2.0
 

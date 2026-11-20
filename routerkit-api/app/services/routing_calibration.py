@@ -3,12 +3,14 @@ freshly trained predictor — mirrors the methodology of the project's
 reference offline experiment (see conversation/README), with the one piece
 that experiment never automated: picking lambda.
 
-The policy itself (services.policy, still to be wired into production
-routing) picks, at each of up to MAX_SHOTS attempts, the active candidate
+The policy itself (services.policy) picks, at each of up to `shots`
+attempts (chosen at train time, POST /train's `shots` — MAX_SHOTS below is
+only the default when not given, not a hard ceiling), the active candidate
 model maximizing `score = Y_pred - lambda * cost/cost_max` among the
-candidates not yet tried for that task. `lambda` is a single scalar per
-shot count (1..MAX_SHOTS) — not learned, not per-task — trading off
-predicted quality against cost.
+candidates not yet tried for that task. Each shot position gets its OWN
+lambda (1..shots) — not learned, not per-task — trading off predicted
+quality against cost, with later positions (fewer remaining attempts
+elsewhere in the budget) free to weigh cost differently than earlier ones.
 
 For each shot count, LAMBDA_GRID values of lambda are swept; for each one,
 a Monte Carlo simulation estimates (accuracy, avg cost per task) under that
@@ -42,6 +44,10 @@ from sqlalchemy.orm import Session
 
 from app.db.models import Grade, Model, Solution
 
+# Default number of sequential routing attempts to calibrate for, when
+# POST /train's `shots` isn't given — not a hard ceiling: a caller can ask
+# for more (up to however many active candidates exist), see
+# services.training.
 MAX_SHOTS = 3
 LAMBDA_GRID = np.linspace(0.0, 5.0, 100)
 TRAIN_REPETITIONS = 500
@@ -106,17 +112,18 @@ def simulate_lambda(
     lam: float,
     repetitions: int,
     rng: np.random.Generator,
+    shots: int = MAX_SHOTS,
 ) -> dict[int, tuple[float, float]]:
-    """Monte Carlo for a single lambda. Returns {shots: (accuracy,
-    avg_cost_per_task)} for shots in 1..MAX_SHOTS — simulated in one pass
+    """Monte Carlo for a single lambda. Returns {shot_count: (accuracy,
+    avg_cost_per_task)} for shot_count in 1..shots — simulated in one pass
     per task (a task's state at shot k already includes shots 1..k-1, so
     every shot count is just a slice of the same run, not a separate one).
     Public: services.reports reuses this directly for the TEST-split sweep
     it plots (the one calibrate_routing itself never needs, since it only
-    evaluates its 3 already-picked lambdas on test, not the whole grid).
+    evaluates its already-picked lambdas on test, not the whole grid).
     """
-    passed_sum = np.zeros(MAX_SHOTS)
-    cost_sum = np.zeros(MAX_SHOTS)
+    passed_sum = np.zeros(shots)
+    cost_sum = np.zeros(shots)
     counted_tasks = 0
 
     for task_id in task_ids:
@@ -133,7 +140,7 @@ def simulate_lambda(
         if not scored:
             continue
         scored.sort(key=lambda t: -t[0])
-        ranked = scored[:MAX_SHOTS]
+        ranked = scored[:shots]
 
         still_trying = np.ones(repetitions, dtype=bool)
         running_cost = np.zeros(repetitions)
@@ -149,19 +156,19 @@ def simulate_lambda(
             cost_sum[shot_idx] += running_cost.mean()
             last_shot_idx = shot_idx
 
-        # A task with fewer real candidates than MAX_SHOTS has no more
+        # A task with fewer real candidates than `shots` has no more
         # options left to try — its last simulated shot's numbers carry
         # forward for any remaining shot counts.
-        for shot_idx in range(last_shot_idx + 1, MAX_SHOTS):
+        for shot_idx in range(last_shot_idx + 1, shots):
             passed_sum[shot_idx] += running_passed.mean()
             cost_sum[shot_idx] += running_cost.mean()
         counted_tasks += 1
 
     if counted_tasks == 0:
-        return dict.fromkeys(range(1, MAX_SHOTS + 1), (0.0, 0.0))
+        return dict.fromkeys(range(1, shots + 1), (0.0, 0.0))
     return {
-        shots: (passed_sum[shots - 1] / counted_tasks, cost_sum[shots - 1] / counted_tasks)
-        for shots in range(1, MAX_SHOTS + 1)
+        shot_count: (passed_sum[shot_count - 1] / counted_tasks, cost_sum[shot_count - 1] / counted_tasks)
+        for shot_count in range(1, shots + 1)
     }
 
 
@@ -200,14 +207,17 @@ def calibrate_routing(
     feature_columns: dict,
     train_task_ids: list[int],
     test_task_ids: list[int],
+    shots: int = MAX_SHOTS,
 ) -> dict:
     """Runs the full lambda calibration for a freshly trained predictor —
     see module docstring. `x`/`row_task_ids`/`row_model_ids` share the same
     row index (the training dataset, see services.training._build_dataset)
     — `model.predict(x)` gives Y_pred per row, paired with its
-    (task_id, model_id) via the other two. Returns
-    {"routing_lambdas": {...}, "lambda_sweep": {...}} ready to persist on
-    the Predictor row.
+    (task_id, model_id) via the other two. `shots` is how many sequential
+    attempts to calibrate for (POST /train's `shots`, already validated by
+    then against the number of active candidates). Returns
+    {"routing_lambdas": {...}, "lambda_sweep": {...}}, keyed "1"..str(shots),
+    ready to persist on the Predictor row.
     """
     candidates = (
         db.query(Model)
@@ -232,10 +242,10 @@ def calibrate_routing(
 
     # One Monte Carlo pass per grid point gives every shot count's
     # (accuracy, cost) at once (simulate_lambda's return already covers
-    # shots 1..MAX_SHOTS) — sweep the grid ONCE here rather than once per
-    # shot count, which would just redo the identical simulation 3x over.
+    # shots 1..`shots`) — sweep the grid ONCE here rather than once per
+    # shot count, which would just redo the identical simulation N times over.
     sweep_points_by_shots: dict[int, list[tuple[float, float, float]]] = {
-        shots: [] for shots in range(1, MAX_SHOTS + 1)
+        shot_count: [] for shot_count in range(1, shots + 1)
     }
     for lam in LAMBDA_GRID:
         result = simulate_lambda(
@@ -248,16 +258,17 @@ def calibrate_routing(
             lam=float(lam),
             repetitions=TRAIN_REPETITIONS,
             rng=rng,
+            shots=shots,
         )
-        for shots in range(1, MAX_SHOTS + 1):
-            accuracy, cost = result[shots]
-            sweep_points_by_shots[shots].append((float(lam), accuracy, cost))
+        for shot_count in range(1, shots + 1):
+            accuracy, cost = result[shot_count]
+            sweep_points_by_shots[shot_count].append((float(lam), accuracy, cost))
 
     routing_lambdas: dict[str, dict] = {}
     lambda_sweep: dict[str, list[dict]] = {}
 
-    for shots in range(1, MAX_SHOTS + 1):
-        sweep_points = sweep_points_by_shots[shots]
+    for shot_count in range(1, shots + 1):
+        sweep_points = sweep_points_by_shots[shot_count]
         winning_lambda = _pick_elbow(sweep_points)
 
         final = simulate_lambda(
@@ -270,15 +281,16 @@ def calibrate_routing(
             lam=winning_lambda,
             repetitions=TEST_REPETITIONS,
             rng=rng,
+            shots=shots,
         )
-        test_accuracy, test_cost = final[shots]
+        test_accuracy, test_cost = final[shot_count]
 
-        routing_lambdas[str(shots)] = {
+        routing_lambdas[str(shot_count)] = {
             "lambda": winning_lambda,
             "test_accuracy": test_accuracy,
             "test_cost_avg": test_cost,
         }
-        lambda_sweep[str(shots)] = [
+        lambda_sweep[str(shot_count)] = [
             {"lambda": lam, "accuracy": acc, "cost_avg": cost} for lam, acc, cost in sweep_points
         ]
 

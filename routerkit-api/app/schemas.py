@@ -183,6 +183,28 @@ class ModelPatchRow(BaseModel):
     deployment: str | None = None
 
 
+class TrainRequest(BaseModel):
+    """Body of `POST /train`. Both fields are optional — an empty body (or
+    none at all) keeps today's behavior: `DEFAULT_ALGORITHM`
+    (GradientBoostingRegressor) and `shots` defaulted to
+    min(routing_calibration.MAX_SHOTS, number of active candidates)."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={"example": {"shots": 3, "algorithms": ["gradient_boosting", "xgboost"]}},
+    )
+
+    # How many sequential routing attempts to calibrate for. Validated
+    # against the number of active candidate models (services/training.py)
+    # — can't exceed it, there'd be nothing left to try at the extra shots.
+    shots: int | None = None
+    # Which services.training.ALGORITHMS keys to try. One -> trained as
+    # requested, no comparison. Several (or omitted -> just the default) ->
+    # each is trained and calibrated, and the winner is picked by actual
+    # routing performance, not raw R² (see services/training.py docstring).
+    algorithms: list[Literal["gradient_boosting", "xgboost", "histgradientboosting", "lightgbm", "random_forest"]] | None = None
+
+
 class CatalogReplaceResult(BaseModel):
     """Response of a catalog import endpoint (tasks/questions/models import
     all share this exact shape)."""
@@ -238,13 +260,16 @@ class RankingEntry(BaseModel):
 
 
 class RouteResponse(BaseModel):
-    """Response of `POST /route`."""
+    """Response of `POST /route`. `ranking` has exactly as many entries as
+    the active predictor's `shots` (set at train time, see
+    services.training) — the sequence to try in order, not every active
+    candidate."""
 
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
                 "decision_id": 42,
-                "lambda_used": 0.45454545454545453,
+                "lambdas_used": [1.6666666666666667, 0.7070707070707071],
                 "ranking": [
                     {"model_id": 33, "model_name": "Grok 4.6", "p": 0.91, "price": 0.0026, "score": 0.8987},
                     {"model_id": 31, "model_name": "Claude Sonnet 5", "p": 0.95, "price": 0.0096, "score": 0.8903},
@@ -255,6 +280,9 @@ class RouteResponse(BaseModel):
     )
 
     decision_id: int
-    lambda_used: float
+    # lambdas_used[i] is the lambda used to pick ranking[i] — each position
+    # was scored under its OWN lambda (see services.policy.schedule_and_select),
+    # not a single shared value.
+    lambdas_used: list[float]
     ranking: list[RankingEntry]
     features_cost_usd: float
