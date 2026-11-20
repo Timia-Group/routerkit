@@ -429,9 +429,16 @@ CREATE TABLE routerkit.predictors (
 
     created_at          TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
+    -- How many sequential routing attempts this predictor was calibrated
+    -- for (chosen at train time, POST /train's `shots`; defaults to 3 if
+    -- not given). routing_lambdas/lambda_sweep below are keyed "1".."shots"
+    -- — POST /route uses exactly this many positions, each with its own
+    -- lambda (see app/services/routing_calibration.py).
+    shots               SMALLINT,
+
     -- Routing policy calibrated for THIS predictor's own Y_pred (score =
     -- Y_pred - lambda * cost/cost_max, see app/services/routing_calibration.py).
-    -- Keyed by shot count ("1".."max shots"): {lambda, test_accuracy,
+    -- Keyed by shot count ("1".."shots"): {lambda, test_accuracy,
     -- test_cost_avg} per key — the lambda that survived the elbow method
     -- on the train-split Monte Carlo sweep, re-evaluated once on the test
     -- split for the reported accuracy/cost.

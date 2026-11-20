@@ -28,8 +28,8 @@ calibrated router:
     decimals that takes — never rounded to the curated grid), what
     accuracy/cost would each shot budget (1/2/3) have gotten, on the test
     split?
-  - frontier: at the production shot budget (MAX_SHOTS), how does the
-    router's (cost, accuracy) compare to always using just one candidate
+  - frontier: at the production shot budget (the predictor's own `shots`),
+    how does the router's (cost, accuracy) compare to always using just one candidate
     model by itself for every attempt? Cost is the TOTAL accumulated cost
     across every test task (not the per-task average) — same unit the
     reference experiment's own frontier chart uses.
@@ -59,7 +59,6 @@ from app.config import settings
 from app.db.models import Model
 from app.services.routing_calibration import (
     LAMBDA_GRID,
-    MAX_SHOTS,
     TEST_REPETITIONS,
     load_model_costs,
     load_outcomes_by_task_model,
@@ -99,14 +98,15 @@ def _simulate_fixed_model(
     model_id: int,
     repetitions: int,
     rng: np.random.Generator,
+    shots: int,
 ) -> dict[int, tuple[float, float]]:
     """Same bootstrap mechanics as routing_calibration.simulate_lambda, but
     with a FIXED model tried at every shot instead of a lambda-ranked one —
     "what if you just always used this one candidate, retrying it up to
-    MAX_SHOTS times?" (the baseline the frontier chart compares the router
+    `shots` times?" (the baseline the frontier chart compares the router
     against)."""
-    passed_sum = np.zeros(MAX_SHOTS)
-    cost_sum = np.zeros(MAX_SHOTS)
+    passed_sum = np.zeros(shots)
+    cost_sum = np.zeros(shots)
     counted_tasks = 0
 
     for task_id in task_ids:
@@ -119,7 +119,7 @@ def _simulate_fixed_model(
         still_trying = np.ones(repetitions, dtype=bool)
         running_cost = np.zeros(repetitions)
         running_passed = np.zeros(repetitions, dtype=bool)
-        for shot_idx in range(MAX_SHOTS):
+        for shot_idx in range(shots):
             draws = rng.choice(pool, size=repetitions, replace=True)
             running_cost = running_cost + np.where(still_trying, cost, 0.0)
             running_passed = running_passed | (still_trying & draws)
@@ -129,10 +129,10 @@ def _simulate_fixed_model(
         counted_tasks += 1
 
     if counted_tasks == 0:
-        return dict.fromkeys(range(1, MAX_SHOTS + 1), (0.0, 0.0))
+        return dict.fromkeys(range(1, shots + 1), (0.0, 0.0))
     return {
-        shots: (passed_sum[shots - 1] / counted_tasks, cost_sum[shots - 1] / counted_tasks)
-        for shots in range(1, MAX_SHOTS + 1)
+        shot_count: (passed_sum[shot_count - 1] / counted_tasks, cost_sum[shot_count - 1] / counted_tasks)
+        for shot_count in range(1, shots + 1)
     }
 
 
@@ -157,6 +157,7 @@ def _build_sankey(
     model_name_by_id: dict[int, str],
     cost_max: float,
     lam: float,
+    shots: int,
 ) -> tuple[go.Figure, pd.DataFrame]:
     """Deterministic ranking structure, no Monte Carlo: for every test
     task, who ranks #1/#2/#3 at this lambda. A ribbon from a shot-k node to
@@ -170,7 +171,7 @@ def _build_sankey(
 
     for task_id in test_task_ids:
         ranked = [m for _, m in _rank(task_id, y_pred_by_task_model, costs_by_model, model_ids, cost_max, lam)]
-        ranked = ranked[:MAX_SHOTS]
+        ranked = ranked[:shots]
         if not ranked:
             continue
 
@@ -207,8 +208,8 @@ def _build_sankey(
     all_nodes = {n for pair in flow for n in pair}
     node_size = {n: node_outgoing.get(n, node_incoming.get(n, 0)) for n in all_nodes}
 
-    columns: list[list[str]] = [[] for _ in range(MAX_SHOTS)]
-    for shot_idx in range(1, MAX_SHOTS + 1):
+    columns: list[list[str]] = [[] for _ in range(shots)]
+    for shot_idx in range(1, shots + 1):
         col_nodes = [n for n in all_nodes if n.endswith(f"· shot {shot_idx}")]
         columns[shot_idx - 1] = sorted(col_nodes, key=lambda n: -node_size[n])
 
@@ -292,8 +293,8 @@ def _build_sankey(
             },
         )
     )
-    for shot_idx in range(1, MAX_SHOTS + 1):
-        x = 0.001 if shot_idx == 1 else 0.999 if shot_idx == MAX_SHOTS else (shot_idx - 1) / (MAX_SHOTS - 1)
+    for shot_idx in range(1, shots + 1):
+        x = 0.001 if shot_idx == 1 else 0.999 if shot_idx == shots else (shot_idx - 1) / (shots - 1)
         fig.add_annotation(
             x=x, y=1.0, xref="paper", yref="paper", yanchor="bottom", showarrow=False,
             text=f"<b>SHOT {shot_idx}</b>", font={"size": 13},
@@ -322,14 +323,15 @@ def _build_sensitivity_table(
     cost_max: float,
     routing_lambdas: dict,
     rng: np.random.Generator,
+    shots: int,
 ) -> tuple[go.Figure, pd.DataFrame]:
     # The curated grid (REPORT_LAMBDAS) alone never lands exactly on the
     # real calibrated lambda for any shot count — plus the exact production
     # value(s), never rounded to the grid, each marked with which shot(s)
     # it was actually picked for.
     production_by_lambda: dict[float, list[int]] = {}
-    for shots in range(1, MAX_SHOTS + 1):
-        production_by_lambda.setdefault(routing_lambdas[str(shots)]["lambda"], []).append(shots)
+    for shot_count in range(1, shots + 1):
+        production_by_lambda.setdefault(routing_lambdas[str(shot_count)]["lambda"], []).append(shot_count)
     all_lambdas = sorted(set(REPORT_LAMBDAS) | set(production_by_lambda))
 
     n_tasks = len(test_task_ids)
@@ -345,12 +347,13 @@ def _build_sensitivity_table(
             lam=lam,
             repetitions=TEST_REPETITIONS,
             rng=rng,
+            shots=shots,
         )
         row = {"lambda": lam, "is_production_for_shots": production_by_lambda.get(lam, [])}
-        for shots in range(1, MAX_SHOTS + 1):
-            accuracy, cost_avg = result[shots]
-            row[f"shot{shots}_accuracy"] = accuracy
-            row[f"shot{shots}_cost_total"] = cost_avg * n_tasks
+        for shot_count in range(1, shots + 1):
+            accuracy, cost_avg = result[shot_count]
+            row[f"shot{shot_count}_accuracy"] = accuracy
+            row[f"shot{shot_count}_cost_total"] = cost_avg * n_tasks
         rows.append(row)
     df = pd.DataFrame(rows)
 
@@ -361,10 +364,10 @@ def _build_sensitivity_table(
         return f"λ = {lam:.2f}"
 
     header = ["λ"] + [
-        f"Shot {s}" + (" (cumulative)" if s == 2 else " (total)" if s == 3 else "") for s in range(1, MAX_SHOTS + 1)
+        f"Shot {s}" + (" (cumulative)" if s == 2 else " (total)" if s == shots else "") for s in range(1, shots + 1)
     ]
     cell_text = [
-        [_lambda_label(lam, shots) for lam, shots in zip(df["lambda"], df["is_production_for_shots"], strict=True)]
+        [_lambda_label(lam, shot_count) for lam, shot_count in zip(df["lambda"], df["is_production_for_shots"], strict=True)]
     ]
     # Production-lambda rows get a distinct pale-blue fill in the λ column
     # ONLY — kept visually separate from the per-column "best accuracy"
@@ -373,11 +376,11 @@ def _build_sensitivity_table(
     # in its column, ignoring cost) that happened to collide on the same
     # color before, which read as "these cells all claim the same thing."
     cell_fill = [
-        ["#A6CEE3" if shots else "white" for shots in df["is_production_for_shots"]]
+        ["#A6CEE3" if shot_count else "white" for shot_count in df["is_production_for_shots"]]
     ]
-    for shots in range(1, MAX_SHOTS + 1):
-        acc = df[f"shot{shots}_accuracy"]
-        cost = df[f"shot{shots}_cost_total"]
+    for shot_count in range(1, shots + 1):
+        acc = df[f"shot{shot_count}_accuracy"]
+        cost = df[f"shot{shot_count}_cost_total"]
         cell_text.append([f"<b>{a * 100:.1f}%</b><br>${c:.2f}" for a, c in zip(acc, cost)])
         best_idx = acc.idxmax()
         lo, hi = acc.min(), acc.max()
@@ -398,7 +401,7 @@ def _build_sensitivity_table(
         )
     )
     fig.update_layout(
-        title=f"λ sensitivity on TEST ({n_tasks} tasks, λ across the {MAX_SHOTS} shots)<br>"
+        title=f"λ sensitivity on TEST ({n_tasks} tasks, λ across the {shots} shots)<br>"
         "<sub>% solved and total cost (all tasks) — gold: best raw accuracy in that "
         "column (cost aside) · blue: exact production λ (★, not rounded to the grid — "
         "the same value marked in tradeoff_curve). These are two different things: the "
@@ -417,6 +420,8 @@ def _build_frontier(
     model_name_by_id: dict[int, str],
     routing_lambdas: dict,
     rng: np.random.Generator,
+    shots: int,
+    algorithm: str,
 ) -> tuple[go.Figure, pd.DataFrame]:
     rows = []
     for model_id in model_ids:
@@ -427,8 +432,9 @@ def _build_frontier(
             model_id=model_id,
             repetitions=TEST_REPETITIONS,
             rng=rng,
+            shots=shots,
         )
-        accuracy, cost_avg = result[MAX_SHOTS]
+        accuracy, cost_avg = result[shots]
         n_tasks = len(test_task_ids)
         rows.append(
             {
@@ -439,10 +445,10 @@ def _build_frontier(
             }
         )
 
-    router = routing_lambdas[str(MAX_SHOTS)]
+    router = routing_lambdas[str(shots)]
     rows.append(
         {
-            "name": "Router GB",
+            "name": f"Router ({algorithm})",
             "accuracy": router["test_accuracy"],
             "cost_total": router["test_cost_avg"] * len(test_task_ids),
             "is_router": True,
@@ -465,7 +471,7 @@ def _build_frontier(
         )
     fig.update_layout(
         title=(
-            f"Cost-quality frontier TEST — shot {MAX_SHOTS} (total) · λ = {router['lambda']:.4f} "
+            f"Cost-quality frontier TEST — shot {shots} (total) · λ = {router['lambda']:.4f} "
             f"({len(test_task_ids)} tasks, Monte Carlo {TEST_REPETITIONS} replicates)"
         ),
         xaxis={"title": "Total cost (USD, all tasks) →", "tickformat": ".2f"},
@@ -484,6 +490,7 @@ def _build_tradeoff_curve(
     cost_max: float,
     routing_lambdas: dict,
     rng: np.random.Generator,
+    shots: int,
 ) -> tuple[go.Figure, pd.DataFrame]:
     n_tasks = len(test_task_ids)
     rows = []
@@ -498,21 +505,22 @@ def _build_tradeoff_curve(
             lam=float(lam),
             repetitions=TEST_REPETITIONS,
             rng=rng,
+            shots=shots,
         )
-        for shots in range(1, MAX_SHOTS + 1):
-            accuracy, cost_avg = result[shots]
-            rows.append({"lambda": float(lam), "shots": shots, "accuracy": accuracy, "cost_total": cost_avg * n_tasks})
+        for shot_count in range(1, shots + 1):
+            accuracy, cost_avg = result[shot_count]
+            rows.append({"lambda": float(lam), "shots": shot_count, "accuracy": accuracy, "cost_total": cost_avg * n_tasks})
     df = pd.DataFrame(rows)
 
     fig = go.Figure()
-    for shots in range(1, MAX_SHOTS + 1):
-        sub = df[df["shots"] == shots].sort_values("lambda")
+    for shot_count in range(1, shots + 1):
+        sub = df[df["shots"] == shot_count].sort_values("lambda")
         fig.add_trace(
             go.Scatter(
                 x=sub["cost_total"],
                 y=sub["accuracy"] * 100,
                 mode="lines+markers",
-                name=f"Shot {shots}",
+                name=f"Shot {shot_count}",
                 marker={"size": 5},
                 customdata=sub["lambda"],
                 hovertemplate="λ=%{customdata:.3f}<br>$%{x:.2f} · %{y:.1f}%<extra></extra>",
@@ -525,18 +533,18 @@ def _build_tradeoff_curve(
     # gives no clue which point was actually picked, and the elbow was
     # never chosen from THIS curve anyway (see below), so eyeballing this
     # curve's own peak for it is misleading.
-    for shots in range(1, MAX_SHOTS + 1):
-        picked = routing_lambdas[str(shots)]
+    for shot_count in range(1, shots + 1):
+        picked = routing_lambdas[str(shot_count)]
         fig.add_trace(
             go.Scatter(
                 x=[picked["test_cost_avg"] * n_tasks],
                 y=[picked["test_accuracy"] * 100],
                 mode="markers+text",
                 marker={"size": 14, "symbol": "star", "color": "black"},
-                text=[f"λ chosen (shot {shots})" if shots == MAX_SHOTS else ""],
+                text=[f"λ chosen (shot {shot_count})" if shot_count == shots else ""],
                 textposition="bottom center",
                 showlegend=False,
-                hovertemplate=f"<b>λ chosen, shot {shots}</b><br>λ=%{{customdata:.3f}}<br>$%{{x:.2f}} · %{{y:.1f}}%<extra></extra>",
+                hovertemplate=f"<b>λ chosen, shot {shot_count}</b><br>λ=%{{customdata:.3f}}<br>$%{{x:.2f}} · %{{y:.1f}}%<extra></extra>",
                 customdata=[picked["lambda"]],
             )
         )
@@ -545,7 +553,7 @@ def _build_tradeoff_curve(
         title=(
             f"Router trade-off on TEST: tasks solved vs. cost, swept across λ<br>"
             f"<sub>{len(test_task_ids)} tasks · Monte Carlo {TEST_REPETITIONS} replicates · "
-            f"each curve runs from λ={LAMBDA_GRID[0]:.0f} to λ={LAMBDA_GRID[-1]:.0f} (only up to {MAX_SHOTS} shots, "
+            f"each curve runs from λ={LAMBDA_GRID[0]:.0f} to λ={LAMBDA_GRID[-1]:.0f} (only up to {shots} shots, "
             "which is what's calibrated for production) · ★ = λ chosen for that shot.<br>"
             "λ is picked on a separate sweep over the TRAIN split (not this curve, which is TEST-only) — "
             "that's why the ★ doesn't have to land exactly on this curve's own peak.</sub>"
@@ -568,10 +576,11 @@ def _build_lambda_grid_heatmap(
     model_ids: list[int],
     model_name_by_id: dict[int, str],
     cost_max: float,
+    shots: int,
 ) -> tuple[go.Figure, pd.DataFrame]:
     """A grid of boxes: one row per lambda (REPORT_LAMBDAS), one column per
-    shot (1..MAX_SHOTS) — mirrors the reference experiment's own "15 DEL
-    ENRUTADOR" chart, just MAX_SHOTS columns instead of its 6. Each box is
+    shot (1..shots) — mirrors the reference experiment's own "15 DEL
+    ENRUTADOR" chart, just `shots` columns instead of its 6. Each box is
     a condensed proportional mosaic (every model's segment width = its
     share of ALL test tasks at that (lambda, shot)) — deterministic
     ranking, no Monte Carlo, no sampling."""
@@ -579,26 +588,26 @@ def _build_lambda_grid_heatmap(
     color_by_model = {name: _PALETTE[i % len(_PALETTE)] for i, name in enumerate(names)}
     n_tasks = len(test_task_ids)
 
-    keys = [(lam, shots) for lam in REPORT_LAMBDAS for shots in range(1, MAX_SHOTS + 1)]
+    keys = [(lam, shot_count) for lam in REPORT_LAMBDAS for shot_count in range(1, shots + 1)]
     counts = {key: dict.fromkeys(names, 0) for key in keys}
     for lam in REPORT_LAMBDAS:
         for task_id in test_task_ids:
             ranked = _rank(task_id, y_pred_by_task_model, costs_by_model, model_ids, cost_max, lam)
-            for shots in range(1, MAX_SHOTS + 1):
-                if shots > len(ranked):
+            for shot_count in range(1, shots + 1):
+                if shot_count > len(ranked):
                     continue
-                winner_name = model_name_by_id[ranked[shots - 1][1]]
-                counts[(lam, shots)][winner_name] += 1
+                winner_name = model_name_by_id[ranked[shot_count - 1][1]]
+                counts[(lam, shot_count)][winner_name] += 1
 
     df = pd.DataFrame(counts).T  # index=(lambda, shots), columns=model name, values=task count
-    df.index = [f"λ={lam:.2f} · shot {shots}" for lam, shots in keys]
+    df.index = [f"λ={lam:.2f} · shot {shot_count}" for lam, shot_count in keys]
 
     n_rows = len(REPORT_LAMBDAS)
     box_w, row_gap, col_gap = 1.0, 0.18, 0.10
     col_stride = box_w + col_gap
 
-    def _box_x(shots: int) -> tuple[float, float]:
-        x0 = (shots - 1) * col_stride
+    def _box_x(shot_count: int) -> tuple[float, float]:
+        x0 = (shot_count - 1) * col_stride
         return x0, x0 + box_w
 
     def _box_y(row_idx: int) -> tuple[float, float]:
@@ -616,11 +625,11 @@ def _build_lambda_grid_heatmap(
     fig = go.Figure()
     for row_idx, lam in enumerate(REPORT_LAMBDAS):
         y0, y1 = _box_y(row_idx)
-        for shots in range(1, MAX_SHOTS + 1):
-            x0, x1 = _box_x(shots)
+        for shot_count in range(1, shots + 1):
+            x0, x1 = _box_x(shot_count)
             cum = 0.0
             for name in names:
-                count = counts[(lam, shots)][name]
+                count = counts[(lam, shot_count)][name]
                 if count == 0:
                     continue
                 frac = count / n_tasks
@@ -636,23 +645,23 @@ def _build_lambda_grid_heatmap(
                     )
                 cum += frac
 
-    for shots in range(1, MAX_SHOTS + 1):
-        x0, x1 = _box_x(shots)
+    for shot_count in range(1, shots + 1):
+        x0, x1 = _box_x(shot_count)
         fig.add_annotation(
             x=(x0 + x1) / 2, y=n_rows + 0.3, showarrow=False,
-            text=f"<b>SHOT {shots}</b>", font={"size": 13},
+            text=f"<b>SHOT {shot_count}</b>", font={"size": 13},
         )
 
     row_centers = [(_box_y(i)[0] + _box_y(i)[1]) / 2 for i in range(n_rows)]
     fig.update_layout(
         title=(
-            f"Who the router assigns each shot to, by λ (full grid: {n_rows} λ × {MAX_SHOTS} shots, "
+            f"Who the router assigns each shot to, by λ (full grid: {n_rows} λ × {shots} shots, "
             f"{n_tasks} test tasks)<br>"
             "<sub>deterministic ranking (no Monte Carlo) — each box represents all test tasks: a "
             f"segment's width is the fraction of the {n_tasks} tasks going to that model at that "
             "(λ, shot)</sub>"
         ),
-        xaxis={"visible": False, "range": [-0.05, (MAX_SHOTS - 1) * col_stride + box_w + 0.05]},
+        xaxis={"visible": False, "range": [-0.05, (shots - 1) * col_stride + box_w + 0.05]},
         yaxis={
             "tickvals": row_centers,
             "ticktext": [f"λ={lam:.2f}" for lam in REPORT_LAMBDAS],
@@ -675,13 +684,15 @@ def generate_training_report(
     feature_columns: dict,
     test_task_ids: list[int],
     routing_lambdas: dict,
+    shots: int,
+    algorithm: str,
 ) -> str:
     """Builds the 5-chart training report (see module docstring) into
     `{ARTIFACTS_DIR}/current/report/` (rotating any previous one to
     `previous/report/`), from the just-trained `model` and the just-picked
-    `routing_lambdas`. Returns the output directory. Never touches the
-    persisted predictor/calibration — purely a read-only visualization
-    pass over the same data `calibrate_routing` already used."""
+    `routing_lambdas` (keyed "1"..str(shots)). Returns the output directory.
+    Never touches the persisted predictor/calibration — purely a read-only
+    visualization pass over the same data `calibrate_routing` already used."""
     out_dir = _rotate_report_dir()
 
     candidates = (
@@ -721,6 +732,7 @@ def generate_training_report(
                 # one is directly comparable rather than showing a
                 # different baseline than what's being compared against.
                 lam=0.0,
+                shots=shots,
             ),
         ),
         (
@@ -734,6 +746,7 @@ def generate_training_report(
                 cost_max=cost_max,
                 routing_lambdas=routing_lambdas,
                 rng=rng,
+                shots=shots,
             ),
         ),
         (
@@ -746,6 +759,8 @@ def generate_training_report(
                 model_name_by_id=model_name_by_id,
                 routing_lambdas=routing_lambdas,
                 rng=rng,
+                shots=shots,
+                algorithm=algorithm,
             ),
         ),
         (
@@ -759,6 +774,7 @@ def generate_training_report(
                 cost_max=cost_max,
                 routing_lambdas=routing_lambdas,
                 rng=rng,
+                shots=shots,
             ),
         ),
         (
@@ -770,6 +786,7 @@ def generate_training_report(
                 model_ids=model_ids,
                 model_name_by_id=model_name_by_id,
                 cost_max=cost_max,
+                shots=shots,
             ),
         ),
     ]
@@ -783,7 +800,7 @@ def generate_training_report(
         # writing it to a local folder in the first place.
         fig.write_html(os.path.join(out_dir, f"{name}.html"), include_plotlyjs=True)
         # A chart that set its own layout height (e.g. lambda_grid, with
-        # MAX_SHOTS*len(REPORT_LAMBDAS) rows) keeps it instead of being
+        # shots*len(REPORT_LAMBDAS) rows) keeps it instead of being
         # squashed into the 900px default every other chart uses.
         png_height = fig.layout.height or 900
         fig.write_image(os.path.join(out_dir, f"{name}.png"), width=1400, height=png_height, scale=2)

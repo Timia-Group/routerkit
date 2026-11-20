@@ -46,9 +46,10 @@ def main() -> None:
         detail = exc.read().decode("utf-8", errors="replace")
         raise SystemExit(f"HTTP {exc.code} calling POST /route: {detail}") from exc
 
-    _log(f"decision_id={result['decision_id']} lambda_used={result['lambda_used']:.4f} "
+    lambdas = ", ".join(f"{lam:.4f}" for lam in result["lambdas_used"])
+    _log(f"decision_id={result['decision_id']} lambdas_used=[{lambdas}] "
          f"features_cost_usd={result['features_cost_usd']:.4f}")
-    _log("ranking:")
+    _log("ranking (one lambda per position, see lambdas_used above):")
     for i, entry in enumerate(result["ranking"], start=1):
         print(
             f"  {i}. {entry['model_name']:<24} p={entry['p']:.4f}  "

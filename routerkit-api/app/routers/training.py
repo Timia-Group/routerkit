@@ -3,8 +3,8 @@ from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.db.base import get_db
-from app.db.models import Predictor
-from app.schemas import JobBoardEntry
+from app.db.models import Model, Predictor
+from app.schemas import JobBoardEntry, TrainRequest
 from app.services import jobs, training
 from app.services.jobs import JobConflictError, ProgressFn
 
@@ -13,8 +13,8 @@ router = APIRouter(tags=["training"])
 _KIND = "train_predictor"
 
 
-def _train_job(db: Session, progress: ProgressFn) -> dict:
-    result = training.train_predictor(db, progress)
+def _train_job(db: Session, progress: ProgressFn, *, shots: int | None, algorithms: list[str] | None) -> dict:
+    result = training.train_predictor(db, progress, shots=shots, algorithms=algorithms)
 
     # Full replace, same pattern as the rest of the system: only one
     # predictor is ever active, and that's always the one POST /route uses.
@@ -27,6 +27,7 @@ def _train_job(db: Session, progress: ProgressFn) -> dict:
         test_mae=result.test_mae,
         feature_columns=result.feature_columns,
         artifact_path=result.artifact_path,
+        shots=result.shots,
         routing_lambdas=result.routing_lambdas,
         lambda_sweep=result.lambda_sweep,
     )
@@ -42,37 +43,67 @@ def _train_job(db: Session, progress: ProgressFn) -> dict:
         "test_r2": result.test_r2,
         "test_mae": result.test_mae,
         "artifact_path": result.artifact_path,
+        "shots": result.shots,
         "routing_lambdas": result.routing_lambdas,
         "report_dir": result.report_dir,
+        "candidates_tried": result.candidates_tried,
     }
 
 
 @router.post("/train", status_code=202, response_model=JobBoardEntry)
-def train(db: Session = Depends(get_db)) -> dict:
+def train(body: TrainRequest = TrainRequest(), db: Session = Depends(get_db)) -> dict:
     """Launches (async) training of a new predictor: recomputes
     targets/model_metrics from the currently active solutions/grades (no
     separate step needed — there's no standalone aggregation endpoint,
     this is the only place that recomputation happens), builds the dataset
-    from active features/targets and trains,
-    then calibrates the routing lambda (services.routing_calibration) for
-    the resulting model and generates a training report (services.reports —
-    charts + data under `{ARTIFACTS_DIR}/current/report/`, same
-    current/previous rotation as the catalog snapshots) — a predictor isn't
-    usable by POST /route without the calibration step, so neither of these
-    is a separate call either. Returns the initial state right away — to
-    see progress (4 phases: data prep, training, routing calibration,
-    report generation) or the final result, check `GET /jobs` (state of ALL
-    kinds in a single request, including this one). 409 if a
+    from active features/targets and trains, then calibrates the routing
+    lambda (services.routing_calibration) for the resulting model and
+    generates a training report (services.reports — charts + data under
+    `{ARTIFACTS_DIR}/current/report/`, same current/previous rotation as
+    the catalog snapshots) — a predictor isn't usable by POST /route
+    without the calibration step, so neither of these is a separate call
+    either. Returns the initial state right away — to see progress (4
+    phases: data prep, training+calibration, picking the winner, report
+    generation) or the final result, check `GET /jobs` (state of ALL kinds
+    in a single request, including this one). 409 if a
     `kind='train_predictor'` job is already running.
 
-    Always the same fixed algorithm (GradientBoostingRegressor), no option
-    to choose a different one — see services.training for why. If there
-    isn't enough active data (missing question_key's, no active
+    `body.shots`: how many sequential routing attempts to calibrate for —
+    1..(number of currently active candidate models); 422 if out of that
+    range. Omitted (or null): defaults to
+    min(routing_calibration.MAX_SHOTS, number of active candidates).
+    POST /route always uses exactly this many positions for whichever
+    predictor ends up active (see routers/routing.py).
+
+    `body.algorithms`: which of services.training.ALGORITHMS's keys to
+    train. One key -> trained as requested. Several (or omitted, which
+    defaults to just `training.DEFAULT_ALGORITHM`) -> each is trained and
+    calibrated, and the winner is picked by actual routing accuracy/cost on
+    the test split (`GET /jobs`'s `last_result.candidates_tried` shows
+    every candidate that was tried and why it won or lost) — not by raw
+    cv_score, see services.training's module docstring.
+
+    If there isn't enough active data (missing question_key's, no active
     targets/candidates, too few distinct tasks with complete data), the job
     ends in `status='error'` with the reason in `GET /jobs`.
     """
+    if body.shots is not None:
+        n_candidates = (
+            db.query(Model).filter(Model.role == "candidate", Model.active.is_(True)).count()
+        )
+        if not (1 <= body.shots <= n_candidates):
+            raise HTTPException(
+                status_code=422,
+                detail=f"shots={body.shots} is invalid — must be between 1 and {n_candidates} "
+                "(the number of active candidate models)",
+            )
+
     try:
-        job = jobs.start_job(_KIND, _train_job, db)
+        job = jobs.start_job(
+            _KIND,
+            lambda db, progress: _train_job(db, progress, shots=body.shots, algorithms=body.algorithms),
+            db,
+        )
     except JobConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 

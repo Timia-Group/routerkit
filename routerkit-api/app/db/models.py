@@ -8,7 +8,7 @@ the top of the SQL schema).
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, Boolean, ForeignKey, Integer, Numeric, String, Text, func
+from sqlalchemy import BigInteger, Boolean, ForeignKey, Integer, Numeric, SmallInteger, String, Text, func
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -212,6 +212,11 @@ class Predictor(Base):
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=func.current_timestamp()
     )
+    # How many sequential routing attempts this predictor was calibrated
+    # for (POST /train's `shots`, default 3) — routing_lambdas/lambda_sweep
+    # are keyed "1"..str(shots). POST /route uses exactly this many
+    # positions (see services/routing_calibration.py).
+    shots: Mapped[int | None] = mapped_column(SmallInteger)
     # Routing policy calibrated for this predictor's own Y_pred, keyed by
     # shot count: {lambda, test_accuracy, test_cost_avg} per key (see
     # services/routing_calibration.py).

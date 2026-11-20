@@ -15,6 +15,10 @@ from app.services.concurrency import run_bounded
 from app.services.features_python import compute_python_feature
 from app.services.routing_calibration import MAX_SHOTS, load_model_costs
 
+# Predictors trained before `shots` existed as a column have it NULL —
+# fall back to the old fixed default rather than crash on them.
+_FALLBACK_SHOTS = MAX_SHOTS
+
 router = APIRouter(tags=["routing"])
 
 
@@ -63,17 +67,20 @@ def _compute_live_feature(task: _AdHocTask, question: Question, feature_model: M
 def route(body: RouteRequest, db: Session = Depends(get_db)) -> dict:
     """Routes a task (`body.prompt`) to the candidate LLMs, using the
     active predictor (POST /train) and the routing policy
-    (services.policy). Returns every active candidate ranked in the order
-    they should be tried — the caller executes them in that order
+    (services.policy). Returns exactly `predictor.shots` candidates, in the
+    order they should be tried — the caller executes them in that order
     (generate a solution, evaluate it, however they choose to) until one
     works; this endpoint only decides the order, it doesn't generate or
-    evaluate anything itself.
+    evaluate anything itself. `shots` is fixed at train time (POST
+    /train's `shots`), not something this endpoint takes as input — see
+    services.training.
 
-    The whole ranking is produced in one shot, with the single lambda
-    calibrated for the full retry budget
-    (routerkit.predictors.routing_lambdas[str(services.routing_calibration.MAX_SHOTS)])
-    — not re-scored call by call as earlier attempts fail, so there's
-    nothing to pass back in about what's already been tried.
+    The sequence is produced in one shot, with a DIFFERENT lambda per
+    position (routerkit.predictors.routing_lambdas[str(1)]..[str(shots)],
+    each calibrated by services.routing_calibration for that specific shot
+    count — see services.policy.schedule_and_select) — not re-scored call
+    by call as earlier attempts fail, so there's nothing to pass back in
+    about what's already been tried.
 
     Computing live features for `prompt` (services.features_llm /
     features_python) is the only part of this that can call an LLM
@@ -91,7 +98,8 @@ def route(body: RouteRequest, db: Session = Depends(get_db)) -> dict:
     artifact = joblib.load(predictor.artifact_path)
     model = artifact["model"]
     feature_columns: dict = artifact["feature_columns"]
-    lam = predictor.routing_lambdas[str(MAX_SHOTS)]["lambda"]
+    shots = predictor.shots or _FALLBACK_SHOTS
+    lambdas_by_position = [predictor.routing_lambdas[str(p)]["lambda"] for p in range(1, shots + 1)]
 
     # Only candidates the predictor was actually trained with a one-hot
     # column for (feature_columns["models"]) can be scored at all — an
@@ -152,7 +160,7 @@ def route(body: RouteRequest, db: Session = Depends(get_db)) -> dict:
         for candidate, pred in zip(known_candidates, predictions, strict=True)
     ]
 
-    decision = policy.score_and_select(scored_candidates, lam=lam, cost_max=cost_max)
+    decision = policy.schedule_and_select(scored_candidates, lambdas_by_position=lambdas_by_position, cost_max=cost_max)
 
     route_decision = RouteDecision(
         predictor_id=predictor.predictor_id,
@@ -167,7 +175,7 @@ def route(body: RouteRequest, db: Session = Depends(get_db)) -> dict:
 
     return {
         "decision_id": route_decision.decision_id,
-        "lambda_used": lam,
+        "lambdas_used": lambdas_by_position,
         "ranking": decision.ranking,
         "features_cost_usd": features_cost_usd,
     }
